@@ -4,17 +4,43 @@
 
 CWL Zen is a minimal, JS-free subset of [CWL v1.2](https://www.commonwl.org/v1.2/) and a fast runner for it. It keeps the workflow layer purely declarative — tools handle logic, CWL handles plumbing.
 
-## Philosophy
-
 > Trust the tools. Wire the plumbing. Nothing more.
 
-- Tools are responsible for their own behavior
-- The workflow layer only declares **what connects to what**
-- All logic (conditionals, arithmetic, string manipulation) belongs in **shell commands inside tool containers**
-- If a tool can't handle something, fix the tool, not the workflow
-- The simplest CWL document that works is the best CWL document
+## Why remove JavaScript?
 
-## What CWL Zen removes from CWL v1.2
+CWL v1.2 allows embedding JavaScript via `InlineJavascriptRequirement`. This is powerful but costly:
+
+- **Requires a JS engine** in every runner implementation (Node.js, SpiderMonkey, etc.)
+- **Breaks static analysis** — can't validate workflows without executing JS
+- **Hides logic** in YAML strings that are hard to debug, test, and review
+- **Reduces portability** — JS expressions behave differently across runners
+- **Slows execution** — launching a JS interpreter for each expression adds overhead
+
+CWL Zen's answer: **you don't need JS.** Every JS expression in a CWL workflow can be replaced with either a CWL parameter reference or a shell command. The result is simpler, faster, and more portable.
+
+"But JS makes CWL more flexible!" — Yes, and that flexibility is the problem. When logic lives in JS expressions scattered across YAML files, workflows become programs. CWL Zen says: **workflows are not programs. They are wiring diagrams.** Logic belongs in tools (shell commands inside containers), not in the orchestration layer.
+
+## Getting Started
+
+### Check if your workflow is CWL Zen compatible
+
+```bash
+# Quick check — if any of these return results, you have work to do:
+grep -rl 'InlineJavascriptRequirement' cwl/
+grep -rn '\${' cwl/
+grep -rn 'when:' cwl/
+grep -rn 'parseInt\|parseFloat\|Math\.' cwl/
+```
+
+### Convert an existing workflow
+
+See the [Refactoring Guide](docs/refactoring-guide.md) — 8 common JS patterns with before/after examples, plus the critical `\$` escaping rule for mixing CWL references with shell commands.
+
+### Write a new CWL Zen workflow
+
+See the [Spec](docs/spec.md) for supported features, or use the [Quick Example](#quick-example) below as a starting point.
+
+## What CWL Zen removes
 
 | Removed | Why | Alternative |
 |---------|-----|-------------|
@@ -22,6 +48,7 @@ CWL Zen is a minimal, JS-free subset of [CWL v1.2](https://www.commonwl.org/v1.2
 | `ExpressionTool` | One execution model, not two | Shell inside `CommandLineTool` |
 | `when` conditionals | Requires JS | Null-tolerant tools |
 | JS in `valueFrom`/`outputEval` | Requires JS | String interpolation + shell |
+| `record`, `enum`, `Any` types | Complexity | Multiple simple inputs, `string` |
 
 ## What CWL Zen keeps
 
@@ -35,27 +62,18 @@ CWL Zen is a minimal, JS-free subset of [CWL v1.2](https://www.commonwl.org/v1.2
 | `DockerRequirement` (dockerPull) | Container per step |
 | `ShellCommandRequirement` | Pipes, redirects, shell logic |
 | `ResourceRequirement` | CPU/RAM hints for scheduler |
+| `NetworkAccess` | Tools that need network |
 | `secondaryFiles` | Index files (.bai, .fai) |
 | `scatter` + `dotproduct` | Parallel over arrays |
+| `StepInputExpressionRequirement` | `valueFrom` with parameter references in workflow steps |
 | `File`, `string`, `int`, `boolean` + optional/array variants | Type system |
-| `$(inputs.X)`, `$(runtime.X)` | Parameter references (no JS) |
-
-## CWL Zen vs Make vs CWL v1.2
-
-```
-CWL v1.2 (full spec — JS, ExpressionTool, complex types)
-  └── CWL Zen (strict subset — no JS, declarative only)
-        └── Make (dependencies + commands, no containers, no types)
-```
-
-CWL Zen adds two things over Make:
-1. **Containers per step** — each tool runs in its own isolated, versioned environment
-2. **Typed files with associations** — `.bam` + `.bai` travel together
+| `$(inputs.X)`, `$(runtime.X)`, `$(self)` | Parameter references (no JS) |
 
 ## Quick Example
 
 ```yaml
-# tool: aligner.cwl
+# aligner.cwl — a CWL Zen tool
+cwlVersion: v1.2
 class: CommandLineTool
 baseCommand: [bwa-mem2, mem]
 hints:
@@ -64,6 +82,7 @@ hints:
 requirements:
   ResourceRequirement:
     coresMin: 8
+
 inputs:
   reference:
     type: File
@@ -74,12 +93,15 @@ inputs:
     inputBinding: { position: 2 }
   sample_id:
     type: string
+
 arguments:
   - prefix: -t
     valueFrom: $(runtime.cores)
   - prefix: -R
     valueFrom: "@RG\\tID:$(inputs.sample_id)\\tSM:$(inputs.sample_id)"
+
 stdout: $(inputs.sample_id).sam
+
 outputs:
   aligned:
     type: File
@@ -88,14 +110,17 @@ outputs:
 ```
 
 ```yaml
-# workflow: pipeline.cwl
+# pipeline.cwl — a CWL Zen workflow
+cwlVersion: v1.2
 class: Workflow
 requirements:
   StepInputExpressionRequirement: {}
+
 inputs:
   sample_id: string
   reads: File
   reference: File
+
 steps:
   align:
     run: aligner.cwl
@@ -110,6 +135,7 @@ steps:
       input_file: align/aligned
       sample_id: sample_id
     out: [sorted_bam]
+
 outputs:
   bam:
     type: File
@@ -118,14 +144,28 @@ outputs:
 
 No JavaScript. No magic. Just tools and wiring.
 
+## CWL Zen vs Make vs CWL v1.2
+
+```
+CWL v1.2 (full spec — JS, ExpressionTool, complex types)
+  └── CWL Zen (strict subset — no JS, declarative only)
+        └── Make (dependencies + commands, no containers, no types)
+```
+
+CWL Zen adds two things over Make:
+1. **Containers per step** — each tool in its own isolated, versioned environment
+2. **Typed files with associations** — `.bam` + `.bai` travel together
+
+If you don't need these, a Makefile is enough.
+
 ## Documentation
 
-- [**Spec**](docs/spec.md) — Complete CWL Zen subset specification, supported features, runner design
-- [**Refactoring Guide**](docs/refactoring-guide.md) — How to eliminate JavaScript from existing CWL workflows (8 patterns with before/after examples)
+- [**Spec**](docs/spec.md) — Supported features, escaping rules, runner design
+- [**Refactoring Guide**](docs/refactoring-guide.md) — 8 patterns to eliminate JS from existing CWL workflows
 
 ## Runner
 
-The CWL Zen runner (`cwl-zen`) is a planned Rust implementation:
+The CWL Zen runner is a planned Rust implementation:
 
 ```bash
 cwl-zen run workflow.cwl input.yml --outdir ./results
@@ -138,21 +178,18 @@ Single static binary. Singularity-native. No JS engine. Fast startup.
 
 **Status:** Design complete, implementation not yet started.
 
-## Reference Implementation
+## Compatibility
 
-The [ChIP-Atlas Pipeline v2](https://github.com/inutano/chip-atlas-pipeline-v2) is the first real-world pipeline built with CWL Zen — 15 tools, 5 workflows, processing 400K+ genomics samples, zero JavaScript.
-
-## Relationship to CWL v1.2
-
-Every CWL Zen document is valid CWL v1.2. You can run CWL Zen workflows on cwltool, Toil, or any compliant CWL runner today. The CWL Zen runner is an optional, minimal alternative.
+Every CWL Zen document is valid CWL v1.2. Run it on cwltool, Toil, or any compliant runner today:
 
 ```bash
-# Works with cwltool
-cwltool workflow.cwl input.yml
-
-# Works with cwl-zen (when available)
-cwl-zen run workflow.cwl input.yml
+cwltool workflow.cwl input.yml           # works now
+cwl-zen run workflow.cwl input.yml       # works when runner ships
 ```
+
+## Reference Implementation
+
+[ChIP-Atlas Pipeline v2](https://github.com/inutano/chip-atlas-pipeline-v2) — 15 tools, 5 workflows, 400K+ genomics samples, zero JavaScript.
 
 ## License
 

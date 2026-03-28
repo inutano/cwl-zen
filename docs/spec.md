@@ -1,174 +1,145 @@
-# CWL Zen
+# CWL Zen Specification
 
-## What is CWL Zen?
+CWL Zen is a strict subset of CWL v1.2. This document defines exactly what is supported and what is not.
 
-CWL Zen is three things:
+## Classes
 
-1. **A philosophy** — trust the tools, keep the workflow layer minimal
-2. **A CWL subset** — a strict subset of CWL v1.2 that is purely declarative
-3. **A runner** — a fast, minimal implementation that executes this subset
+| Class | Supported |
+|-------|-----------|
+| `CommandLineTool` | Yes |
+| `Workflow` | Yes |
+| `ExpressionTool` | **No** — use shell inside `CommandLineTool` |
 
-## Philosophy
+## CommandLineTool Features
 
-**"Trust the tools. Wire the plumbing. Nothing more."**
-
-- Tools are responsible for their own behavior — reading inputs, handling edge cases, producing outputs
-- The workflow layer only declares **what connects to what**
-- All logic (conditionals, arithmetic, string manipulation) belongs in **shell commands inside tool containers**
-- If a tool can't handle something, fix the tool (or its wrapper script), not the workflow
-- The simplest CWL document that works is the best CWL document
-
-### What CWL Zen is NOT
-
-- Not a general-purpose programming environment embedded in YAML
-- Not a place to put business logic, validation, or data transformation
-- Not a framework that tries to anticipate every edge case
-
-## CWL Zen Subset
-
-### Two classes, that's it
-
-| Class | Purpose |
-|-------|---------|
-| `CommandLineTool` | Defines a tool: command, inputs, outputs |
-| `Workflow` | Wires tools together: step A's output → step B's input |
-
-### CommandLineTool
-
-```yaml
-class: CommandLineTool
-baseCommand: [tool, subcommand]
-requirements:
-  DockerRequirement:
-    dockerPull: "quay.io/biocontainers/tool:version"
-  ShellCommandRequirement: {}       # if you need pipes/redirects
-  ResourceRequirement:              # optional: hints for scheduler
-    coresMin: 8
-    ramMin: 16384
-  NetworkAccess:                    # optional: if tool needs network
-    networkAccess: true
-
-inputs:
-  input_file:
-    type: File
-    inputBinding:
-      prefix: --input
-      position: 1
-  sample_id:
-    type: string
-
-arguments:
-  - prefix: --output
-    valueFrom: $(inputs.sample_id).result.txt
-  - prefix: --threads
-    valueFrom: $(runtime.cores)
-
-stdout: $(inputs.sample_id).log
-
-outputs:
-  result:
-    type: File
-    outputBinding:
-      glob: "*.result.txt"
-```
-
-**Supported features:**
+### Supported
 
 | Feature | Notes |
 |---------|-------|
+| `cwlVersion: v1.2` | Required |
 | `baseCommand` | Command to run |
 | `arguments` | Static args and parameter references |
-| `inputs` with `inputBinding` | `prefix`, `position`, `shellQuote` |
-| `outputs` with `outputBinding` | `glob` for file collection |
+| `inputs` with `inputBinding` | `prefix`, `position`, `separate`, `shellQuote` |
+| `outputs` with `outputBinding` | `glob` (with parameter references) |
 | `stdout` | Capture stdout to file |
-| `DockerRequirement` | `dockerPull` only — executed via Singularity |
+| `secondaryFiles` | On inputs and outputs |
+| `DockerRequirement` | `dockerPull` only |
 | `ShellCommandRequirement` | For pipes, redirects, shell logic |
-| `ResourceRequirement` | `coresMin`, `ramMin` — passed to scheduler |
+| `ResourceRequirement` | `coresMin`, `ramMin` |
 | `NetworkAccess` | For tools that need network |
-| `secondaryFiles` | Index files (.bai, .fai, etc.) |
 
-**Not supported (by design):**
+### Not Supported
 
-| Feature | Why not | Alternative |
-|---------|---------|-------------|
+| Feature | Why | Alternative |
+|---------|-----|-------------|
 | `InlineJavascriptRequirement` | No JS engine | Parameter references + shell |
 | `InitialWorkDirRequirement` | Complex staging | Shell commands |
-| `EnvVarRequirement` | Shell can do this | `export VAR=val` in command |
-| `stdin` | Rarely needed | Shell redirect in command |
-| `stderr` | Rarely needed | Shell redirect in command |
+| `EnvVarRequirement` | Unnecessary | `export VAR=val` in shell command |
+| `stdin` | Rarely needed | Shell redirect: `< file` |
+| `stderr` | Rarely needed | Shell redirect: `2> file` |
 | `successCodes` | Trust the tool | Tool should exit properly |
-| `loadContents` / `outputEval` | Needs JS | Read files in shell |
+| `outputEval` with JS | Requires JS | Output as File, read in consuming tool's shell |
 
-### Workflow
+### `loadContents` and `outputEval`
+
+`loadContents: true` itself is a CWL feature, not JavaScript. However, useful `outputEval` expressions (like `$(parseInt(self[0].contents))`) require JS.
+
+**CWL Zen approach:** Don't parse values in CWL. Output raw data as a `File` and let the consuming tool read it in its shell command:
 
 ```yaml
-class: Workflow
-inputs:
-  sample_id: string
-  fastq: File
-  reference: File
-
-steps:
-  align:
-    run: tools/aligner.cwl
-    in:
-      reads: fastq
-      ref: reference
-      name: sample_id
-    out: [bam]
-
-  peaks:
-    run: tools/peak-caller.cwl
-    scatter: bam            # optional: parallel over arrays
-    scatterMethod: dotproduct
-    in:
-      bam: align/bam
-      name: sample_id
-    out: [peaks]
-
+# Producer: output count as a text file
 outputs:
-  result:
+  count_file:
     type: File
-    outputSource: peaks/peaks
+    outputBinding:
+      glob: count.txt
+
+# Consumer: read the file in shell
+arguments:
+  - shellQuote: false
+    valueFrom: |
+      COUNT=\$(cat $(inputs.count_file.path))
+      tool --count "\$COUNT"
 ```
 
-**Supported features:**
+## Workflow Features
+
+### Supported
 
 | Feature | Notes |
 |---------|-------|
 | `steps` with `in`/`out` | Core wiring |
 | `outputSource` | Connect step outputs to workflow outputs |
-| `scatter` + `dotproduct` | Parallel execution over arrays |
+| `scatter` | Single input or multiple |
+| `scatterMethod: dotproduct` | Zip arrays element-wise |
+| `ScatterFeatureRequirement` | Required for `scatter` |
+| `StepInputExpressionRequirement` | For `valueFrom` with parameter references (not JS) |
 
-**Not supported (by design):**
+### Not Supported
 
-| Feature | Why not | Alternative |
-|---------|---------|-------------|
-| `when` | Needs JS | Handle null gracefully in tool |
-| `SubworkflowFeatureRequirement` | Complexity | Flatten to one level |
-| `MultipleInputFeatureRequirement` | `merge_flattened`, `pickValue` are complex | Redesign wiring |
-| `StepInputExpressionRequirement` | Needs JS | Not needed |
-| `scatterMethod: crossproduct` | Rarely needed | Bash loop |
+| Feature | Why | Alternative |
+|---------|-----|-------------|
+| `when` | Requires JS (`$(inputs.x != null)`) | Make tools null-tolerant |
+| `SubworkflowFeatureRequirement` | Complexity | Flatten to one workflow level |
+| `MultipleInputFeatureRequirement` | `merge_flattened`, `pickValue` are complex | Redesign step wiring |
+| `scatterMethod: flat_crossproduct` | Rarely needed | Bash loop |
+| `scatterMethod: nested_crossproduct` | Rarely needed | Bash loop |
 
-### Types
+### `StepInputExpressionRequirement` — Supported (without JS)
 
-| Type | Supported |
-|------|-----------|
-| `File` | Yes, with `secondaryFiles` |
-| `File?` | Yes (optional) |
-| `File[]` | Yes (arrays) |
-| `string`, `int`, `float`, `boolean`, `long`, `double` | Yes |
-| Optional variants (`string?`, etc.) | Yes |
-| Array variants (`string[]`, etc.) | Yes |
-| `null` | Yes |
-| `Directory` | Yes |
-| `record` | No — use multiple simple inputs |
-| `enum` | No — use `string` |
-| `Any` | No |
+`StepInputExpressionRequirement` enables `valueFrom` on workflow step inputs. CWL Zen supports this for **parameter references only** — no JavaScript:
 
-### Parameter References
+```yaml
+# SUPPORTED — parameter reference + literal text:
+requirements:
+  StepInputExpressionRequirement: {}
+steps:
+  peak_call:
+    in:
+      sample_id:
+        source: sample_id
+        valueFrom: $(self).q05       # $(self) is a parameter reference
+```
 
-Simple string interpolation — no JS, no expressions:
+```yaml
+# NOT SUPPORTED — JavaScript expression:
+steps:
+  peak_call:
+    in:
+      sample_id:
+        source: sample_id
+        valueFrom: $(self + "_q05")  # string concatenation is JS
+```
+
+The difference: `$(self).q05` is `$(self)` (parameter reference) followed by literal text `.q05`. This is string interpolation. `$(self + "_q05")` uses the `+` operator, which is JavaScript.
+
+## Type System
+
+### Supported
+
+| Type | Notes |
+|------|-------|
+| `File` | With `secondaryFiles` |
+| `Directory` | |
+| `string` | |
+| `int`, `long` | |
+| `float`, `double` | |
+| `boolean` | |
+| `null` | |
+| Optional: `File?`, `string?`, etc. | |
+| Arrays: `File[]`, `string[]`, etc. | |
+
+### Not Supported
+
+| Type | Alternative |
+|------|-------------|
+| `record` | Use multiple simple inputs |
+| `enum` | Use `string` |
+| `Any` | Use specific type |
+
+## Parameter References
+
+CWL Zen uses CWL v1.2 parameter references — **not JavaScript**. These work without `InlineJavascriptRequirement`:
 
 ```
 $(inputs.sample_id)              → input value
@@ -176,37 +147,110 @@ $(inputs.bam.path)               → file path
 $(inputs.bam.basename)           → filename
 $(inputs.bam.nameroot)           → filename without extension
 $(inputs.bam.nameext)            → extension
-$(inputs.bam.size)               → file size
-$(runtime.cores)                 → CPU cores
-$(runtime.ram)                   → RAM in MB
+$(inputs.bam.size)               → file size in bytes
+$(runtime.cores)                 → allocated CPU cores
+$(runtime.ram)                   → allocated RAM in MB
 $(runtime.outdir)                → output directory
-$(runtime.tmpdir)                → temp directory
+$(runtime.tmpdir)                → temporary directory
+$(self)                          → current value (in valueFrom)
 ```
 
-Rules:
-- `$(inputs.x)` is replaced with the value
-- `"prefix_$(inputs.x)_suffix"` concatenation works
-- No arithmetic: `$(1+1)` is NOT supported — use shell `$((1+1))`
-- No function calls: `$(parseInt(...))` is NOT supported — use shell
-- No conditionals: `$(x ? y : z)` is NOT supported — use shell `if`
+### String interpolation
 
-## Runner
+Parameter references can be embedded in strings:
 
-### What it does
+```yaml
+# All valid — no JS needed:
+stdout: $(inputs.sample_id).sam
+valueFrom: "@RG\\tID:$(inputs.sample_id)\\tSM:$(inputs.sample_id)"
+glob: "$(inputs.sample_id).sorted.bam"
+```
+
+### What parameter references CANNOT do
+
+```yaml
+# Arithmetic — use shell instead
+$(1000000 / inputs.count)           # NO
+\$(awk 'BEGIN {print 1000000/n}')   # YES (in shell)
+
+# Function calls — use shell instead
+$(parseInt(self[0].contents))       # NO
+\$(cat file.txt)                    # YES (in shell)
+
+# Conditionals — use shell instead
+$(inputs.x ? "a" : "b")            # NO
+if [ ... ]; then ...; fi            # YES (in shell)
+
+# String concatenation with + operator
+$(inputs.x + ".suffix")            # NO
+$(inputs.x).suffix                  # YES (interpolation)
+```
+
+## The Escaping Rule
+
+When writing shell commands in CWL `valueFrom`, you must distinguish between CWL parameter references and shell syntax:
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `$(inputs.x)` | CWL resolves this | `$(inputs.sample_id)` → `"SRX123"` |
+| `\$(command)` | Shell command substitution | `\$(cat file.txt)` → file contents |
+| `\$VAR` | Shell variable | `\$SCALE` → value of SCALE |
+| `"\$VAR"` | Quoted shell variable | `"\$SCALE"` → value of SCALE (safe) |
+
+**Example mixing both:**
+
+```yaml
+arguments:
+  - shellQuote: false
+    valueFrom: |
+      COUNT=\$(cat $(inputs.count_file.path))
+      #     ^^^                ^^^ CWL parameter reference
+      #     shell command substitution
+      SCALE=\$(awk -v n=\$COUNT 'BEGIN {printf "%.10f", 1000000/n}')
+      #                 ^^^ shell variable
+      tool -s "\$SCALE" -i $(inputs.bam.path)
+      #       ^^^ shell var   ^^^ CWL ref
+```
+
+**Rule of thumb:** If it's a CWL input or runtime value, use `$(...)`. If it's a shell variable or command, use `\$(...)` or `\$VAR`.
+
+## Null Handling
+
+When a `File?` input is null, `$(inputs.optional_file.path)` resolves to the string `"null"` in most CWL runners. Use this in shell to test:
+
+```yaml
+inputs:
+  optional_file:
+    type: File?
+
+arguments:
+  - shellQuote: false
+    valueFrom: |
+      F="$(inputs.optional_file.path)"
+      if [ "\$F" != "null" ] && [ -e "\$F" ]; then
+        process "\$F"
+      fi
+```
+
+This pattern replaces `when: $(inputs.optional_file != null)` in workflows — the tool handles null gracefully instead of the workflow skipping the step.
+
+## Runner Design
+
+### Execution model
 
 ```
 CWL document + input YAML → parse → build DAG → execute steps → collect outputs
 ```
 
-That's it. One workflow, one input, one run.
+One workflow, one input, one run. Everything else (batch, scheduling, retry) is external.
 
 ### CLI
 
 ```bash
 cwl-zen run workflow.cwl input.yml --outdir ./results
 cwl-zen validate workflow.cwl
-cwl-zen dag workflow.cwl            # print step graph
 cwl-zen lint workflow.cwl           # check CWL Zen compatibility
+cwl-zen dag workflow.cwl            # print step dependency graph
 ```
 
 ### Implementation
@@ -220,17 +264,17 @@ cwl-zen/
 └── main.rs        — CLI
 ```
 
-**Language: Rust** — single static binary, fast startup, deploy anywhere on HPC.
+**Language:** Rust — single static binary, fast startup, deploy anywhere on HPC.
 
-### What it does NOT do
+### Not the runner's job
 
-| Not the runner's job | Who does it |
-|---------------------|-------------|
+| Concern | Who handles it |
+|---------|---------------|
 | Batch processing | User / AI agent / bash loop |
-| Job scheduling | SLURM/SGE (user submits `cwl-zen run` as a job) |
+| Job scheduling | SLURM/SGE (submit `cwl-zen run` as a job) |
 | Retry on failure | User / wrapper script |
 | Monitoring | External tools |
-| Provenance / RO-Crate | Separate util (`cwl-zen-prov`) |
+| Provenance / RO-Crate | `cwl-zen-prov` (separate tool) |
 | Image pulling | `singularity pull` (done beforehand) |
 
 ## Ecosystem
@@ -239,80 +283,19 @@ Separate tools, not part of the runner:
 
 | Tool | Purpose |
 |------|---------|
-| `cwl-zen-lint` | Validate CWL Zen compatibility (no JS, no ExpressionTool) |
-| `cwl-zen-prov` | Generate RO-Crate provenance from completed runs |
-| `cwl-zen-dispatch` | Helper scripts for SLURM/SGE/PBS job submission |
+| `cwl-zen-lint` | Validate CWL Zen compatibility |
+| `cwl-zen-prov` | Generate RO-Crate provenance |
+| `cwl-zen-dispatch` | Helper scripts for SLURM/SGE/PBS |
 
-## Why not just use Make?
+## Compatibility
 
-CWL Zen and Make are philosophically similar — both declare dependencies and run commands. The comparison is instructive:
-
-| Aspect | Makefile | CWL Zen |
-|--------|---------|---------|
-| **Dependency unit** | Files on disk | Typed inputs/outputs (File, string, int) |
-| **Containerization** | None (runs on host) | Built-in (Singularity/Docker per step) |
-| **Portability** | Machine-specific (paths, installed tools) | Portable (containers carry the tools) |
-| **Reproducibility** | Fragile (depends on host environment) | Strong (container versions pinned) |
-| **Type safety** | None (everything is a filename string) | File vs string vs int, optional types, arrays |
-| **Secondary files** | Manual (you track .bai alongside .bam) | Declarative (`secondaryFiles` pattern) |
-| **Parallelism** | `make -j N` (file-level) | `scatter` (data-level: same tool on N samples) |
-| **Intermediate files** | Stay on disk (you add `clean:` targets) | Managed by runner (staging/collection) |
-| **Ecosystem** | Universal, 50 years of tooling | CWL runners, WES API, RO-Crate provenance |
-
-**Same pipeline in Make vs CWL Zen:**
-
-```makefile
-# Makefile — you manage tools, paths, and file associations yourself
-%.bam: %.fastq reference.fa
-	bwa-mem2 mem -t 8 reference.fa $< | samtools sort -o $@
-	samtools index $@
-
-%.peaks: %.bam
-	macs3 callpeak -t $< -n $* -g hs --nomodel
-```
-
-```yaml
-# CWL Zen — containers and typed files, same simplicity
-steps:
-  align:
-    run: bwa-mem2.cwl          # tool + container defined once
-    in:
-      fastq: fastq             # typed: File with .fai secondaryFiles
-      reference: reference
-    out: [bam]                 # bam + .bai travel together
-
-  peaks:
-    run: macs3.cwl
-    in:
-      bam: align/bam
-    out: [peaks]
-```
-
-CWL Zen adds just two things over Make:
-
-1. **Containers per step** — each tool runs in its own isolated, versioned environment. No "works on my machine" problems. Make can't do this without wrapper scripts everywhere.
-
-2. **Typed files with associations** — when you declare `type: File` with `secondaryFiles: [.bai]`, the runner ensures the index travels with the BAM. In Make, you manually track both and hope they stay in sync.
-
-If you don't need containers or typed file associations, a Makefile is enough. But for bioinformatics pipelines where tool version reproducibility and file associations (.bam+.bai, .fa+.fai+.0123+...) are critical, CWL Zen adds just enough structure.
-
-**CWL Zen is a Makefile with containers and typed files.**
-
-## Relationship to CWL v1.2
-
-CWL Zen documents are a **strict subset** of CWL v1.2. Any CWL Zen document runs on cwltool, Toil, or any compliant CWL runner. The reverse is not true.
+CWL Zen documents are a **strict subset** of CWL v1.2:
 
 ```
 CWL v1.2 (full spec)
-  └── CWL Zen (strict subset, no JS, no ExpressionTool)
+  └── CWL Zen (no JS, no ExpressionTool, no when)
 ```
 
-`cwl-zen-lint` checks compatibility:
-```bash
-$ cwl-zen-lint workflow.cwl
-PASS: No InlineJavascriptRequirement
-PASS: No ExpressionTool
-PASS: No 'when' conditionals
-PASS: All valueFrom use parameter references only
-PASS: CWL Zen compatible
-```
+- Any CWL Zen document runs on cwltool, Toil, or any CWL v1.2 runner
+- The reverse is not true — CWL documents with JS are not CWL Zen compatible
+- `cwl-zen-lint` checks compatibility
