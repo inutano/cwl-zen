@@ -81,6 +81,8 @@ valueFrom: |
 
 No JS engine. No portability surprises. No hidden logic.
 
+> *Water flows through the riverbed. It doesn't reshape the stones — it finds the path between them. A workflow should do the same: let data flow through tools, without trying to change what the tools do.*
+
 ## Getting Started
 
 ### Check if your workflow is CWL Zen compatible
