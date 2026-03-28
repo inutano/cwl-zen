@@ -81,7 +81,7 @@ valueFrom: |
 
 No JS engine. No portability surprises. No hidden logic.
 
-> *Water flows through the riverbed. It doesn't reshape the stones — it finds the path between them. A workflow should do the same: let data flow through tools, without trying to change what the tools do.*
+> *The river doesn't decide where to go. The riverbed does.*
 
 ## Getting Started
 
