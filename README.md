@@ -10,15 +10,76 @@ CWL Zen is a minimal, JS-free subset of [CWL v1.2](https://www.commonwl.org/v1.2
 
 CWL v1.2 allows embedding JavaScript via `InlineJavascriptRequirement`. This is powerful but costly:
 
-- **Requires a JS engine** in every runner implementation (Node.js, SpiderMonkey, etc.)
-- **Breaks static analysis** — can't validate workflows without executing JS
-- **Hides logic** in YAML strings that are hard to debug, test, and review
-- **Reduces portability** — JS expressions behave differently across runners
-- **Slows execution** — launching a JS interpreter for each expression adds overhead
+**Requires a JS engine** in every runner implementation (Node.js, SpiderMonkey, etc.) — this is why writing a new CWL runner is hard. A minimal CWL runner without JS support could be ~2,000 lines of code. With JS, you inherit an entire language runtime.
 
-CWL Zen's answer: **you don't need JS.** Every JS expression in a CWL workflow can be replaced with either a CWL parameter reference or a shell command. The result is simpler, faster, and more portable.
+**Breaks static analysis** — you can't validate a workflow without executing JS. Is this expression correct? You won't know until runtime:
+
+```yaml
+# Typo in 'sample_id' — no error until the workflow runs
+valueFrom: $(inputs.sampl_id + ".bam")
+```
+
+**Hides logic in YAML strings** — debugging JS embedded in YAML is painful. Error messages point to CWL line numbers, not JS line numbers. You can't set breakpoints or step through expressions:
+
+```yaml
+# When this fails, good luck finding the bug:
+valueFrom: |
+  ${
+    var parts = inputs.filename.split(".");
+    var ext = parts[parts.length - 1];
+    if (ext == "gz") return inputs.filename.replace(".gz", "");
+    else return inputs.filename;
+  }
+```
+
+**Reduces portability** — JS expressions behave differently across runners. Real examples:
+
+```yaml
+# What does $(inputs.optional_file.path) return when optional_file is null?
+# cwltool:  "null" (string)
+# Toil:     null (actual null, may throw)
+# Arvados:  undefined behavior
+# Your code depends on which runner you test with.
+
+# What about $(inputs.count + 1) when count is a string "42"?
+# JS coercion: "42" + 1 = "421" (string concatenation!)
+# You expected: 43
+
+# Array handling:
+# $(inputs.files.length) — works in cwltool's JS engine
+# But is 'length' guaranteed across all CWL JS implementations?
+```
+
+**Slows execution** — launching a JS interpreter for each `$(...)` expression adds overhead. In a workflow with 10 steps and 5 expressions each, that's 50 JS interpreter invocations. For a pipeline processing 400K samples, this adds up.
+
+CWL Zen's answer: **you don't need any of this.** Every JS expression in a CWL workflow can be replaced with either a CWL parameter reference or a shell command. The result is simpler, faster, and more portable.
 
 "But JS makes CWL more flexible!" — Yes, and that flexibility is the problem. When logic lives in JS expressions scattered across YAML files, workflows become programs. CWL Zen says: **workflows are not programs. They are wiring diagrams.** Logic belongs in tools (shell commands inside containers), not in the orchestration layer.
+
+The same examples above, in CWL Zen:
+
+```yaml
+# Filename: just use parameter reference interpolation
+valueFrom: $(inputs.sample_id).bam
+
+# Strip .gz extension: do it in the tool's shell command
+valueFrom: |
+  F=$(inputs.filename.path)
+  tool --input "\${F%.gz}"
+
+# Null handling: test in shell, works the same everywhere
+valueFrom: |
+  F="$(inputs.optional_file.path)"
+  if [ "\$F" != "null" ] && [ -e "\$F" ]; then
+    tool "\$F"
+  fi
+
+# Arithmetic: shell, not JS
+valueFrom: |
+  RESULT=\$(($(inputs.count) + 1))
+```
+
+No JS engine. No portability surprises. No hidden logic.
 
 ## Getting Started
 
