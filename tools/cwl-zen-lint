@@ -20,6 +20,49 @@ import argparse
 from pathlib import Path
 
 
+GUIDE_URL = "https://github.com/inutano/cwl-zen/blob/master/docs/refactoring-guide.md"
+
+# Map rule names to refactoring guide sections and fix hints
+RULE_HINTS = {
+    "no-inline-js": (
+        "Remove the requirement. Most $(inputs.X) references work without it.",
+        f"{GUIDE_URL}#1-string-concatenation-with--operator"
+    ),
+    "no-expression-tool": (
+        "Replace with a CommandLineTool that does the transformation in shell.",
+        f"{GUIDE_URL}#5-parseint--outputeval-with-js-functions"
+    ),
+    "no-js-block": (
+        "Move the conditional logic into a shell if/else inside the tool's command.",
+        f"{GUIDE_URL}#3-conditional-if--blocks"
+    ),
+    "no-js-function": (
+        "Output raw data as a File and let the consuming tool parse it in shell.",
+        f"{GUIDE_URL}#5-parseint--outputeval-with-js-functions"
+    ),
+    "no-js-operator": (
+        "Use string interpolation: $(inputs.x).suffix instead of $(inputs.x + '.suffix')",
+        f"{GUIDE_URL}#1-string-concatenation-with--operator"
+    ),
+    "no-js-arithmetic": (
+        "Move arithmetic to shell: \\$(awk 'BEGIN {print 1000000/n}')",
+        f"{GUIDE_URL}#2-arithmetic-expressions"
+    ),
+    "no-when": (
+        "Remove 'when' and make the tool handle null input gracefully in shell.",
+        f"{GUIDE_URL}#6-conditional-workflow-steps-when-clause"
+    ),
+    "unsupported-feature": (
+        "Use shell commands inside the tool instead.",
+        f"{GUIDE_URL}"
+    ),
+    "unsupported-type": (
+        "Use simpler types (string, multiple inputs).",
+        f"{GUIDE_URL}"
+    ),
+}
+
+
 class Issue:
     def __init__(self, file, line, level, rule, message):
         self.file = file
@@ -27,10 +70,15 @@ class Issue:
         self.level = level  # "error" or "warning"
         self.rule = rule
         self.message = message
+        self.hint, self.doc_url = RULE_HINTS.get(rule, ("", ""))
 
     def __str__(self):
         loc = f"{self.file}:{self.line}" if self.line else self.file
-        return f"  {self.level.upper()}: [{self.rule}] {self.message} ({loc})"
+        s = f"  {self.level.upper()}: [{self.rule}] {self.message} ({loc})"
+        if self.hint:
+            s += f"\n         Fix: {self.hint}"
+            s += f"\n         See: {self.doc_url}"
+        return s
 
 
 def find_line(content, needle):
