@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+cwl-zen-lint: Check if CWL documents are CWL Zen compatible.
+
+CWL Zen is a strict, JS-free subset of CWL v1.2.
+This tool checks for InlineJavascriptRequirement, ExpressionTool,
+'when' clauses, JS expressions, and unsupported features.
+
+Usage:
+  cwl-zen-lint workflow.cwl
+  cwl-zen-lint cwl/tools/*.cwl cwl/workflows/*.cwl
+  cwl-zen-lint --quiet workflow.cwl   # exit code only
+"""
+
+import sys
+import yaml
+import os
+import re
+import argparse
+from pathlib import Path
+
+
+class Issue:
+    def __init__(self, file, line, level, rule, message):
+        self.file = file
+        self.line = line
+        self.level = level  # "error" or "warning"
+        self.rule = rule
+        self.message = message
+
+    def __str__(self):
+        loc = f"{self.file}:{self.line}" if self.line else self.file
+        return f"  {self.level.upper()}: [{self.rule}] {self.message} ({loc})"
+
+
+def find_line(content, needle):
+    """Find the line number of a string in file content."""
+    for i, line in enumerate(content.splitlines(), 1):
+        if needle in line:
+            return i
+    return None
+
+
+def lint_file(filepath):
+    """Lint a single CWL file. Returns list of Issues."""
+    issues = []
+    path = str(filepath)
+
+    try:
+        content = filepath.read_text()
+    except Exception as e:
+        issues.append(Issue(path, None, "error", "read", f"Cannot read file: {e}"))
+        return issues
+
+    try:
+        doc = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        issues.append(Issue(path, None, "error", "yaml", f"Invalid YAML: {e}"))
+        return issues
+
+    if not isinstance(doc, dict):
+        issues.append(Issue(path, None, "error", "format", "Not a valid CWL document"))
+        return issues
+
+    cwl_class = doc.get("class", "")
+
+    # --- Rule: no ExpressionTool ---
+    if cwl_class == "ExpressionTool":
+        line = find_line(content, "class: ExpressionTool")
+        issues.append(Issue(path, line, "error", "no-expression-tool",
+                            "ExpressionTool is not allowed. Use CommandLineTool with shell commands."))
+
+    # --- Rule: no InlineJavascriptRequirement ---
+    for section in ["requirements", "hints"]:
+        reqs = doc.get(section, {})
+        if isinstance(reqs, dict) and "InlineJavascriptRequirement" in reqs:
+            line = find_line(content, "InlineJavascriptRequirement")
+            issues.append(Issue(path, line, "error", "no-inline-js",
+                                "InlineJavascriptRequirement is not allowed. Use parameter references + shell."))
+        elif isinstance(reqs, list):
+            for req in reqs:
+                if isinstance(req, dict) and req.get("class") == "InlineJavascriptRequirement":
+                    line = find_line(content, "InlineJavascriptRequirement")
+                    issues.append(Issue(path, line, "error", "no-inline-js",
+                                        "InlineJavascriptRequirement is not allowed."))
+
+    # --- Rule: no JS blocks ${...} ---
+    for i, line_text in enumerate(content.splitlines(), 1):
+        stripped = line_text.strip()
+        if stripped.startswith("#"):
+            continue
+        if "${" in line_text and "shellQuote" not in line_text:
+            # Check it's actually a JS block, not a shell variable in a comment
+            if re.search(r'\$\{', line_text):
+                issues.append(Issue(path, i, "error", "no-js-block",
+                                    f"JavaScript block found: {stripped[:80]}"))
+
+    # --- Rule: no JS functions in expressions ---
+    js_functions = ["parseInt", "parseFloat", "Math.", ".split(", ".join(", ".replace(", ".trim()",
+                     ".indexOf(", ".substring(", ".slice(", ".match(", "JSON."]
+    for i, line_text in enumerate(content.splitlines(), 1):
+        stripped = line_text.strip()
+        if stripped.startswith("#"):
+            continue
+        for func in js_functions:
+            if func in line_text and "$(" in line_text:
+                issues.append(Issue(path, i, "error", "no-js-function",
+                                    f"JavaScript function '{func}' found: {stripped[:80]}"))
+
+    # --- Rule: no JS operators in $() expressions ---
+    # Look for $(... + ...) or $(... != ...) etc. but not $(inputs.x) or $(runtime.x)
+    for i, line_text in enumerate(content.splitlines(), 1):
+        stripped = line_text.strip()
+        if stripped.startswith("#"):
+            continue
+        # Find $(...) expressions
+        for match in re.finditer(r'\$\(([^)]+)\)', line_text):
+            expr = match.group(1)
+            # Simple parameter references are OK: inputs.x, inputs.x.path, runtime.cores, self
+            if re.match(r'^(inputs\.[a-zA-Z_][\w.]*|runtime\.\w+|self(\.\w+)*)$', expr.strip()):
+                continue
+            # String concatenation with + is JS
+            if " + " in expr:
+                issues.append(Issue(path, i, "error", "no-js-operator",
+                                    f"JavaScript operator in expression: $({expr[:60]})"))
+            # Comparison operators
+            if " != " in expr or " === " in expr or " == " in expr or " !== " in expr:
+                issues.append(Issue(path, i, "error", "no-js-operator",
+                                    f"JavaScript comparison in expression: $({expr[:60]})"))
+            # Ternary
+            if " ? " in expr and " : " in expr:
+                issues.append(Issue(path, i, "error", "no-js-operator",
+                                    f"JavaScript ternary in expression: $({expr[:60]})"))
+            # Arithmetic (but allow simple numbers like 1000000)
+            if re.search(r'inputs\.\w+\s*[+\-*/]', expr) or re.search(r'[+\-*/]\s*inputs\.\w+', expr):
+                issues.append(Issue(path, i, "error", "no-js-arithmetic",
+                                    f"JavaScript arithmetic in expression: $({expr[:60]})"))
+
+    # --- Rule: no 'when' clauses (Workflow only) ---
+    if cwl_class == "Workflow":
+        steps = doc.get("steps", {})
+        if isinstance(steps, dict):
+            for step_name, step in steps.items():
+                if isinstance(step, dict) and "when" in step:
+                    line = find_line(content, "when:")
+                    issues.append(Issue(path, line, "error", "no-when",
+                                        f"'when' clause in step '{step_name}'. Make the tool handle null input instead."))
+
+    # --- Rule: no unsupported features (warnings) ---
+    unsupported_reqs = [
+        "InitialWorkDirRequirement",
+        "EnvVarRequirement",
+    ]
+    for section in ["requirements", "hints"]:
+        reqs = doc.get(section, {})
+        if isinstance(reqs, dict):
+            for req_name in unsupported_reqs:
+                if req_name in reqs:
+                    line = find_line(content, req_name)
+                    issues.append(Issue(path, line, "warning", "unsupported-feature",
+                                        f"{req_name} is not part of CWL Zen. Consider using shell commands instead."))
+
+    # --- Rule: no unsupported types (warnings) ---
+    def check_types(obj, context=""):
+        if isinstance(obj, dict):
+            type_val = obj.get("type", "")
+            if isinstance(type_val, str):
+                if type_val == "record":
+                    issues.append(Issue(path, None, "warning", "unsupported-type",
+                                        f"'record' type used{context}. Consider multiple simple inputs."))
+                elif type_val == "enum":
+                    issues.append(Issue(path, None, "warning", "unsupported-type",
+                                        f"'enum' type used{context}. Consider using 'string'."))
+            for k, v in obj.items():
+                check_types(v, f" in {k}")
+        elif isinstance(obj, list):
+            for item in obj:
+                check_types(item, context)
+
+    check_types(doc.get("inputs", {}))
+
+    return issues
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="cwl-zen-lint: Check CWL documents for CWL Zen compatibility",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+CWL Zen is a strict, JS-free subset of CWL v1.2.
+See https://github.com/inutano/cwl-zen for details.
+
+Rules checked:
+  no-inline-js       No InlineJavascriptRequirement
+  no-expression-tool No ExpressionTool class
+  no-js-block        No ${...} JavaScript blocks
+  no-js-function     No JS functions (parseInt, Math, etc.)
+  no-js-operator     No JS operators in $() expressions
+  no-js-arithmetic   No arithmetic in $() expressions
+  no-when            No 'when' clauses in workflow steps
+  unsupported-feature Warns about non-Zen requirements
+  unsupported-type   Warns about record/enum types
+        """,
+    )
+    parser.add_argument("files", nargs="+", help="CWL files to check")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Only output errors, no summary")
+    parser.add_argument("--warnings", "-w", action="store_true",
+                        help="Also show warnings (default: errors only)")
+    args = parser.parse_args()
+
+    total_errors = 0
+    total_warnings = 0
+    total_files = 0
+    passed_files = 0
+
+    for filepath_str in args.files:
+        filepath = Path(filepath_str)
+        if not filepath.exists():
+            print(f"  ERROR: File not found: {filepath}")
+            total_errors += 1
+            continue
+
+        total_files += 1
+        issues = lint_file(filepath)
+
+        errors = [i for i in issues if i.level == "error"]
+        warnings = [i for i in issues if i.level == "warning"]
+        total_errors += len(errors)
+        total_warnings += len(warnings)
+
+        if not errors and not warnings:
+            passed_files += 1
+            if not args.quiet:
+                print(f"PASS: {filepath}")
+        elif not errors and warnings:
+            passed_files += 1
+            if not args.quiet:
+                print(f"PASS: {filepath} ({len(warnings)} warning(s))")
+            if args.warnings:
+                for w in warnings:
+                    print(w)
+        else:
+            print(f"FAIL: {filepath} ({len(errors)} error(s), {len(warnings)} warning(s))")
+            for e in errors:
+                print(e)
+            if args.warnings:
+                for w in warnings:
+                    print(w)
+
+    if not args.quiet:
+        print()
+        print(f"{'=' * 40}")
+        print(f"Files checked:  {total_files}")
+        print(f"Passed:         {passed_files}")
+        print(f"Failed:         {total_files - passed_files}")
+        print(f"Errors:         {total_errors}")
+        print(f"Warnings:       {total_warnings}")
+        print(f"{'=' * 40}")
+        if total_errors == 0:
+            print("All files are CWL Zen compatible!")
+        else:
+            print("Some files need refactoring. See: docs/refactoring-guide.md")
+
+    sys.exit(1 if total_errors > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()
