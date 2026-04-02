@@ -1,14 +1,34 @@
 #!/bin/bash
 # Wrapper for cwltest conformance tests.
-# cwltest calls: cwl-zen-runner.sh <cwl-file> [job-file]
+# cwltest calls: runner --outdir=DIR [--quiet] <cwl-file> [job-file]
 set -e
-CWL_FILE="$1"
-JOB_FILE="${2:---}"
-OUTDIR=$(mktemp -d)
 
-if [ "$JOB_FILE" = "--" ] || [ -z "$JOB_FILE" ]; then
-    # No input file — create empty one
+OUTDIR=""
+CWL_FILE=""
+JOB_FILE=""
+
+# Parse args — cwltest passes --outdir and --quiet before positional args
+for arg in "$@"; do
+    case "$arg" in
+        --outdir=*) OUTDIR="${arg#--outdir=}" ;;
+        --quiet) ;;  # ignore
+        *)
+            if [ -z "$CWL_FILE" ]; then
+                CWL_FILE="$arg"
+            elif [ -z "$JOB_FILE" ]; then
+                JOB_FILE="$arg"
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$OUTDIR" ]; then
+    OUTDIR=$(mktemp -d)
+fi
+
+if [ -z "$JOB_FILE" ]; then
     JOB_FILE="$OUTDIR/empty-input.yml"
+    mkdir -p "$OUTDIR"
     echo "{}" > "$JOB_FILE"
 fi
 
