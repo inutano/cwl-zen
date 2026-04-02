@@ -1,4 +1,5 @@
 pub mod command;
+pub mod container;
 pub mod dag;
 pub mod execute;
 pub mod input;
@@ -7,3 +8,4 @@ pub mod param;
 pub mod parse;
 pub mod provenance;
 pub mod stage;
+pub mod staging;
