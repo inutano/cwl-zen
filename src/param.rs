@@ -62,6 +62,54 @@ pub fn value_to_string(val: &ResolvedValue) -> String {
     }
 }
 
+/// Convert a `ResolvedValue` to a CWL-style JSON value for conformance test output.
+pub fn value_to_json(val: &ResolvedValue) -> serde_json::Value {
+    match val {
+        ResolvedValue::String(s) => serde_json::json!(s),
+        ResolvedValue::Int(n) => serde_json::json!(n),
+        ResolvedValue::Float(f) => serde_json::json!(f),
+        ResolvedValue::Bool(b) => serde_json::json!(b),
+        ResolvedValue::File(fv) => {
+            let mut obj = serde_json::json!({
+                "class": "File",
+                "location": format!("file://{}", fv.path),
+                "path": &fv.path,
+                "basename": &fv.basename,
+                "nameroot": &fv.nameroot,
+                "nameext": &fv.nameext,
+                "size": fv.size,
+            });
+            if !fv.secondary_files.is_empty() {
+                obj["secondaryFiles"] = serde_json::Value::Array(
+                    fv.secondary_files.iter().map(|sf| value_to_json(&ResolvedValue::File(sf.clone()))).collect()
+                );
+            }
+            obj
+        }
+        ResolvedValue::Directory(fv) => {
+            serde_json::json!({
+                "class": "Directory",
+                "location": format!("file://{}", fv.path),
+                "path": &fv.path,
+                "basename": &fv.basename,
+            })
+        }
+        ResolvedValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(value_to_json).collect())
+        }
+        ResolvedValue::Null => serde_json::Value::Null,
+    }
+}
+
+/// Convert a HashMap of outputs to CWL-style JSON for stdout.
+pub fn outputs_to_json(outputs: &std::collections::HashMap<String, ResolvedValue>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, val) in outputs {
+        map.insert(name.clone(), value_to_json(val));
+    }
+    serde_json::Value::Object(map)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------

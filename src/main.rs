@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
+use serde_json;
 
 use cwl_zen::container;
 use cwl_zen::dag;
@@ -213,6 +214,10 @@ fn cmd_run(
                 }
             }
 
+            // Print CWL-style JSON output to stdout (for conformance tests)
+            let json_out = cwl_zen::param::outputs_to_json(&result.outputs);
+            println!("{}", serde_json::to_string_pretty(&json_out).unwrap_or_default());
+
             eprintln!("Workflow completed successfully");
             eprintln!("Outputs in: {}", outdir.display());
         }
@@ -244,10 +249,9 @@ fn cmd_run(
                 }
             };
 
-            // Print outputs to stderr
-            for (name, val) in &outputs {
-                eprintln!("  {name}: {val:?}");
-            }
+            // Print CWL-style JSON output to stdout (for conformance tests)
+            let json_out = cwl_zen::param::outputs_to_json(&outputs);
+            println!("{}", serde_json::to_string_pretty(&json_out).unwrap_or_default());
 
             if exit_code != 0 {
                 eprintln!("Tool exited with code {exit_code}");
