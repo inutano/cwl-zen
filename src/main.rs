@@ -66,7 +66,7 @@ fn main() {
     }
 }
 
-fn cmd_run(cwl_file: &PathBuf, input_file: &PathBuf, outdir: &PathBuf, _no_crate: bool) {
+fn cmd_run(cwl_file: &PathBuf, input_file: &PathBuf, outdir: &PathBuf, no_crate: bool) {
     // 1. Parse CWL file
     let doc = match parse::parse_cwl(cwl_file) {
         Ok(d) => d,
@@ -127,12 +127,13 @@ fn cmd_run(cwl_file: &PathBuf, input_file: &PathBuf, outdir: &PathBuf, _no_crate
                 process::exit(1);
             }
 
-            // Provenance generation (when provenance module is available)
-            // if !_no_crate {
-            //     if let Err(e) = provenance::generate_crate(&result) {
-            //         eprintln!("Error generating RO-Crate: {e:#}");
-            //     }
-            // }
+            if !no_crate {
+                if let Err(e) = cwl_zen::provenance::generate_crate(&result, outdir) {
+                    eprintln!("Warning: failed to generate RO-Crate provenance: {e:#}");
+                } else {
+                    eprintln!("Provenance: {}/ro-crate-metadata.json", outdir.display());
+                }
+            }
 
             eprintln!("Workflow completed successfully");
             eprintln!("Outputs in: {}", outdir.display());
