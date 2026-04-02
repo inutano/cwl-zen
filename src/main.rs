@@ -35,6 +35,22 @@ enum Commands {
         /// Skip RO-Crate provenance generation
         #[arg(long)]
         no_crate: bool,
+
+        /// Container engine override (auto-detected if not set)
+        #[arg(long, value_parser = ["docker", "podman", "singularity", "apptainer"])]
+        engine: Option<String>,
+
+        /// Container image cache directory
+        #[arg(long)]
+        container_cache: Option<PathBuf>,
+
+        /// Force copy-staging for all inputs (instead of symlinks)
+        #[arg(long)]
+        copy_inputs: bool,
+
+        /// Disable automatic retry with copy-staging on symlink failures
+        #[arg(long)]
+        no_retry_copy: bool,
     },
 
     /// Validate one or more CWL files
@@ -60,7 +76,20 @@ fn main() {
             input_file,
             outdir,
             no_crate,
-        } => cmd_run(&cwl_file, &input_file, &outdir, no_crate),
+            engine,
+            container_cache,
+            copy_inputs,
+            no_retry_copy,
+        } => cmd_run(
+            &cwl_file,
+            &input_file,
+            &outdir,
+            no_crate,
+            engine.as_deref(),
+            container_cache.as_deref(),
+            copy_inputs,
+            no_retry_copy,
+        ),
 
         Commands::Validate { files } => cmd_validate(&files),
 
@@ -68,7 +97,16 @@ fn main() {
     }
 }
 
-fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
+fn cmd_run(
+    cwl_file: &Path,
+    input_file: &Path,
+    outdir: &Path,
+    no_crate: bool,
+    engine_name: Option<&str>,
+    container_cache: Option<&Path>,
+    copy_inputs: bool,
+    no_retry_copy: bool,
+) {
     // 1. Parse CWL file
     let doc = match parse::parse_cwl(cwl_file) {
         Ok(d) => d,
@@ -97,18 +135,35 @@ fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
         process::exit(1);
     }
 
-    // 4. Detect container engine
-    let engine: Box<dyn container::ContainerEngine> = match container::detect_engine() {
-        Ok(e) => e,
-        Err(_) => {
-            // Fall back to Docker if no engine detected (it will error at
-            // runtime if Docker is not installed and a container step is hit)
-            Box::new(container::OciEngine::docker())
+    // 4. Resolve container cache directory
+    let _cache_dir = container::resolve_container_cache(container_cache);
+
+    // 5. Select container engine
+    let engine: Box<dyn container::ContainerEngine> = if let Some(name) = engine_name {
+        match container::engine_by_name(name) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                process::exit(1);
+            }
+        }
+    } else {
+        match container::detect_engine() {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("Warning: no container engine found; tools without DockerRequirement will still work");
+                Box::new(container::OciEngine::docker())
+            }
         }
     };
+    eprintln!("Container engine: {}", engine.name());
 
-    let staging_mode = StagingMode::Symlink;
-    let no_retry_copy = false;
+    // 6. Determine staging mode
+    let staging_mode = if copy_inputs {
+        StagingMode::Copy
+    } else {
+        StagingMode::Symlink
+    };
 
     match doc {
         CwlDocument::Workflow(wf) => {
