@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -128,46 +128,6 @@ pub fn resolve_secondary_file_path(primary: &Path, pattern: &str) -> PathBuf {
     }
 }
 
-/// Build Docker volume mount arguments for input files.
-///
-/// - Mount `workdir` as `/work` (read-write)
-/// - For each `File` or `Directory` input, mount its parent directory read-only
-///   (deduplicated)
-/// - Recursively include secondary files
-pub fn build_docker_mounts(
-    inputs: &HashMap<String, ResolvedValue>,
-    workdir: &Path,
-) -> Vec<String> {
-    let mut mounts = Vec::new();
-
-    // Mount workdir as /work
-    let workdir_abs = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
-    mounts.push(format!(
-        "--mount=type=bind,source={},target=/work",
-        workdir_abs.display()
-    ));
-
-    // Collect unique parent directories from all file inputs
-    let mut mounted_dirs: HashSet<PathBuf> = HashSet::new();
-    collect_file_dirs(inputs, &mut mounted_dirs);
-
-    // Sort for deterministic output
-    let mut dirs: Vec<PathBuf> = mounted_dirs.into_iter().collect();
-    dirs.sort();
-
-    for dir in dirs {
-        mounts.push(format!(
-            "--mount=type=bind,source={},target={},readonly",
-            dir.display(),
-            dir.display()
-        ));
-    }
-
-    mounts
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -217,44 +177,6 @@ fn strip_extension(path: &Path) -> PathBuf {
             p
         }
         None => path.to_path_buf(),
-    }
-}
-
-/// Recursively collect parent directories of all File/Directory values.
-fn collect_file_dirs(inputs: &HashMap<String, ResolvedValue>, dirs: &mut HashSet<PathBuf>) {
-    for val in inputs.values() {
-        collect_file_dirs_from_value(val, dirs);
-    }
-}
-
-/// Recursively extract parent directories from a single resolved value.
-fn collect_file_dirs_from_value(val: &ResolvedValue, dirs: &mut HashSet<PathBuf>) {
-    match val {
-        ResolvedValue::File(fv) | ResolvedValue::Directory(fv) => {
-            let path = Path::new(&fv.path);
-            if let Some(parent) = path.parent() {
-                let parent_buf = parent.to_path_buf();
-                if !parent_buf.as_os_str().is_empty() {
-                    dirs.insert(parent_buf);
-                }
-            }
-            // Include secondary files
-            for sf in &fv.secondary_files {
-                let sf_path = Path::new(&sf.path);
-                if let Some(parent) = sf_path.parent() {
-                    let parent_buf = parent.to_path_buf();
-                    if !parent_buf.as_os_str().is_empty() {
-                        dirs.insert(parent_buf);
-                    }
-                }
-            }
-        }
-        ResolvedValue::Array(arr) => {
-            for item in arr {
-                collect_file_dirs_from_value(item, dirs);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -339,47 +261,6 @@ mod tests {
         let glob = GlobPattern::Array(vec!["*.bam".to_string(), "*.cram".to_string()]);
         let result = resolve_glob_patterns(&glob, &inputs, &runtime);
         assert_eq!(result, vec!["*.bam", "*.cram"]);
-    }
-
-    // -- build_docker_mounts ---------------------------------------------------
-
-    #[test]
-    fn docker_mounts_deduplicates() {
-        let mut inputs = HashMap::new();
-        inputs.insert(
-            "file1".to_string(),
-            ResolvedValue::File(FileValue {
-                path: "/data/a.txt".to_string(),
-                basename: "a.txt".to_string(),
-                nameroot: "a".to_string(),
-                nameext: ".txt".to_string(),
-                size: 100,
-                secondary_files: Vec::new(),
-            }),
-        );
-        inputs.insert(
-            "file2".to_string(),
-            ResolvedValue::File(FileValue {
-                path: "/data/b.txt".to_string(),
-                basename: "b.txt".to_string(),
-                nameroot: "b".to_string(),
-                nameext: ".txt".to_string(),
-                size: 200,
-                secondary_files: Vec::new(),
-            }),
-        );
-
-        let workdir = Path::new("/tmp/workdir");
-        let mounts = build_docker_mounts(&inputs, workdir);
-
-        // First mount is always workdir
-        assert!(mounts[0].contains("/tmp/workdir"));
-        assert!(mounts[0].contains("target=/work"));
-
-        // /data should appear exactly once (deduplicated)
-        let data_mounts: Vec<&String> = mounts.iter().filter(|m| m.contains("/data")).collect();
-        assert_eq!(data_mounts.len(), 1);
-        assert!(data_mounts[0].contains("readonly"));
     }
 
     // -- collect_outputs with real files on disk --------------------------------
