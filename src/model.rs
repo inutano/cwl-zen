@@ -8,6 +8,16 @@ use std::path::Path;
 
 pub trait HasId {
     fn take_id(&mut self) -> Option<String>;
+
+    /// Construct an instance from a bare type string (e.g. `"File"`, `"int?"`).
+    /// Used for CWL shorthand syntax like `inputs: { file1: File }`.
+    /// Returns `None` if this type does not support shorthand construction.
+    fn from_type_str(_type_str: &str) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -20,7 +30,7 @@ pub trait HasId {
 pub fn deserialize_map_or_list<'de, D, V>(deserializer: D) -> Result<HashMap<String, V>, D::Error>
 where
     D: Deserializer<'de>,
-    V: Deserialize<'de> + HasId,
+    V: serde::de::DeserializeOwned + HasId,
 {
     use serde::de::{self, MapAccess, SeqAccess, Visitor};
     use std::fmt;
@@ -30,7 +40,7 @@ where
 
     impl<'de, V> Visitor<'de> for MapOrListVisitor<V>
     where
-        V: Deserialize<'de> + HasId,
+        V: serde::de::DeserializeOwned + HasId,
     {
         type Value = HashMap<String, V>;
 
@@ -43,7 +53,25 @@ where
             M: MapAccess<'de>,
         {
             let mut result = HashMap::new();
-            while let Some((key, value)) = map.next_entry::<String, V>()? {
+            while let Some(key) = map.next_key::<String>()? {
+                // Deserialize as intermediate Value first to detect bare strings
+                let raw: serde_yaml::Value = map.next_value()?;
+                let value = match &raw {
+                    serde_yaml::Value::String(s) => {
+                        // Try shorthand type syntax first (e.g. "File", "int?")
+                        match V::from_type_str(s) {
+                            Some(v) => v,
+                            // Fall back to normal deserialization (e.g. StepInput
+                            // has its own string handling)
+                            None => serde_yaml::from_value(raw)
+                                .map_err(de::Error::custom)?,
+                        }
+                    }
+                    _ => {
+                        // Full struct (mapping) — deserialize normally
+                        serde_yaml::from_value(raw).map_err(de::Error::custom)?
+                    }
+                };
                 result.insert(key, value);
             }
             Ok(result)
@@ -259,6 +287,17 @@ impl HasId for ToolInput {
     fn take_id(&mut self) -> Option<String> {
         self.id.take()
     }
+
+    fn from_type_str(type_str: &str) -> Option<Self> {
+        Some(ToolInput {
+            id: None,
+            cwl_type: CwlType::Single(type_str.to_string()),
+            input_binding: None,
+            secondary_files: Vec::new(),
+            doc: None,
+            default: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -309,6 +348,16 @@ pub struct ToolOutput {
 impl HasId for ToolOutput {
     fn take_id(&mut self) -> Option<String> {
         self.id.take()
+    }
+
+    fn from_type_str(type_str: &str) -> Option<Self> {
+        Some(ToolOutput {
+            id: None,
+            cwl_type: CwlType::Single(type_str.to_string()),
+            output_binding: None,
+            secondary_files: Vec::new(),
+            doc: None,
+        })
     }
 }
 
@@ -544,6 +593,16 @@ impl HasId for WorkflowInput {
     fn take_id(&mut self) -> Option<String> {
         self.id.take()
     }
+
+    fn from_type_str(type_str: &str) -> Option<Self> {
+        Some(WorkflowInput {
+            id: None,
+            cwl_type: CwlType::Single(type_str.to_string()),
+            secondary_files: Vec::new(),
+            doc: None,
+            default: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -565,6 +624,15 @@ pub struct WorkflowOutput {
 impl HasId for WorkflowOutput {
     fn take_id(&mut self) -> Option<String> {
         self.id.take()
+    }
+
+    fn from_type_str(type_str: &str) -> Option<Self> {
+        Some(WorkflowOutput {
+            id: None,
+            cwl_type: CwlType::Single(type_str.to_string()),
+            output_source: None,
+            doc: None,
+        })
     }
 }
 
@@ -739,6 +807,7 @@ pub struct FileValue {
     pub nameroot: String,
     pub nameext: String,
     pub size: u64,
+    pub checksum: Option<String>,
     pub secondary_files: Vec<FileValue>,
 }
 
@@ -746,6 +815,8 @@ impl FileValue {
     /// Build a `FileValue` from a filesystem path. The file does not need to
     /// exist (size will be 0 if it cannot be read).
     pub fn from_path(p: &str) -> Self {
+        use sha1::{Sha1, Digest};
+
         let path = Path::new(p);
         let basename = path
             .file_name()
@@ -764,12 +835,29 @@ impl FileValue {
                 .to_string()
         };
         let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let checksum = if path.exists() && path.is_file() {
+            if let Ok(mut file) = std::fs::File::open(path) {
+                let mut hasher = Sha1::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = std::io::Read::read(&mut file, &mut buf).unwrap_or(0);
+                    if n == 0 { break; }
+                    hasher.update(&buf[..n]);
+                }
+                Some(format!("sha1${:x}", hasher.finalize()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         FileValue {
             path: p.to_string(),
             basename,
             nameroot,
             nameext,
             size,
+            checksum,
             secondary_files: Vec::new(),
         }
     }
@@ -1189,6 +1277,96 @@ stdout: output.sam
                 assert_eq!(binding.item_separator, Some(",".to_string()));
                 // Check output union type
                 assert!(tool.outputs["sam"].cwl_type.is_optional());
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- FileValue checksum ---------------------------------------------------
+
+    #[test]
+    fn file_value_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello").unwrap();
+        let fv = FileValue::from_path(path.to_str().unwrap());
+        assert!(fv.checksum.is_some());
+        assert!(fv.checksum.as_ref().unwrap().starts_with("sha1$"));
+    }
+
+    #[test]
+    fn file_value_checksum_missing_file() {
+        let fv = FileValue::from_path("/nonexistent/file.txt");
+        assert!(fv.checksum.is_none());
+    }
+
+    // -- Shorthand type syntax in map-form inputs/outputs ---------------------
+
+    #[test]
+    fn parse_shorthand_input_types() {
+        let yaml = r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  file1: File
+  count: int
+  flag: boolean
+  opt: File?
+outputs:
+  result: stdout
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert_eq!(tool.inputs.len(), 4);
+                assert_eq!(tool.inputs["file1"].cwl_type.base_type(), "File");
+                assert_eq!(tool.inputs["count"].cwl_type.base_type(), "int");
+                assert_eq!(tool.inputs["flag"].cwl_type.base_type(), "boolean");
+                assert!(tool.inputs["opt"].cwl_type.is_optional());
+                assert_eq!(tool.outputs.len(), 1);
+                assert_eq!(tool.outputs["result"].cwl_type.base_type(), "stdout");
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_shorthand_workflow_types() {
+        let yaml = r#"
+cwlVersion: v1.2
+class: Workflow
+inputs:
+  message: string
+  ref_file: File
+steps: {}
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::Workflow(wf) => {
+                assert_eq!(wf.inputs["message"].cwl_type.base_type(), "string");
+                assert_eq!(wf.inputs["ref_file"].cwl_type.base_type(), "File");
+            }
+            _ => panic!("Expected Workflow"),
+        }
+    }
+
+    #[test]
+    fn parse_shorthand_array_type() {
+        let yaml = r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  reads: File[]
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert!(tool.inputs["reads"].cwl_type.is_array());
+                assert_eq!(tool.inputs["reads"].cwl_type.base_type(), "File");
             }
             _ => panic!("Expected CommandLineTool"),
         }

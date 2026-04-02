@@ -240,6 +240,7 @@ mod tests {
                 nameroot: "test".to_string(),
                 nameext: ".txt".to_string(),
                 size: 100,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );
@@ -269,6 +270,7 @@ mod tests {
                 nameroot: "input".to_string(),
                 nameext: ".txt".to_string(),
                 size: 50,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );
@@ -323,6 +325,7 @@ outputs: {}
                 nameroot: "ref".to_string(),
                 nameext: ".fa".to_string(),
                 size: 3_000_000_000,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );

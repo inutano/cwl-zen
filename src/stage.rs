@@ -203,6 +203,7 @@ mod tests {
                 nameroot: "sample.sorted".to_string(),
                 nameext: ".bam".to_string(),
                 size: 1024,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );

@@ -215,10 +215,26 @@ pub fn execute_tool(
         })?;
     }
 
-    // 9. Collect outputs
+    // 9. Check for cwl.output.json (CWL spec: tool can write outputs as JSON)
+    let cwl_output_json_path = workdir.join("cwl.output.json");
+    if cwl_output_json_path.exists() {
+        let json_str = fs::read_to_string(&cwl_output_json_path)
+            .with_context(|| format!("reading cwl.output.json from {}", cwl_output_json_path.display()))?;
+        let json_val: serde_json::Value = serde_json::from_str(&json_str)
+            .with_context(|| "parsing cwl.output.json")?;
+        if let serde_json::Value::Object(map) = json_val {
+            let mut outputs = HashMap::new();
+            for (key, val) in map {
+                outputs.insert(key, json_to_resolved_value(&val, workdir));
+            }
+            return Ok((exit_code, outputs));
+        }
+    }
+
+    // 10. Fall through to normal glob-based output collection
     let outputs = stage::collect_outputs(tool, &staged_inputs, runtime, workdir)?;
 
-    // 10. Return
+    // 11. Return
     Ok((exit_code, outputs))
 }
 
@@ -393,6 +409,63 @@ pub fn execute_workflow(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Convert a serde_json::Value into a ResolvedValue.
+///
+/// Handles CWL File/Directory objects (with `class` field) as well as
+/// primitive types and arrays. Relative paths are resolved against `workdir`.
+fn json_to_resolved_value(val: &serde_json::Value, workdir: &Path) -> ResolvedValue {
+    match val {
+        serde_json::Value::Null => ResolvedValue::Null,
+        serde_json::Value::Bool(b) => ResolvedValue::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                ResolvedValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                ResolvedValue::Float(f)
+            } else {
+                ResolvedValue::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => ResolvedValue::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            ResolvedValue::Array(arr.iter().map(|v| json_to_resolved_value(v, workdir)).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let class = map.get("class").and_then(|v| v.as_str());
+            if class == Some("File") {
+                let path_str = map
+                    .get("path")
+                    .or(map.get("location"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let path_str = path_str.strip_prefix("file://").unwrap_or(path_str);
+                let path = if Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    workdir.join(path_str)
+                };
+                ResolvedValue::File(FileValue::from_path(&path.to_string_lossy()))
+            } else if class == Some("Directory") {
+                let path_str = map
+                    .get("path")
+                    .or(map.get("location"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let path_str = path_str.strip_prefix("file://").unwrap_or(path_str);
+                let path = if Path::new(path_str).is_absolute() {
+                    PathBuf::from(path_str)
+                } else {
+                    workdir.join(path_str)
+                };
+                ResolvedValue::Directory(FileValue::from_path(&path.to_string_lossy()))
+            } else {
+                // Generic object: serialize back to JSON string
+                ResolvedValue::String(serde_json::to_string(val).unwrap_or_default())
+            }
+        }
+    }
+}
+
 /// Resolve a source reference to a value.
 ///
 /// If the source contains `/`, look up step_outputs[step_name][output_name].
@@ -553,6 +626,7 @@ mod tests {
                 nameroot: "aligned".to_string(),
                 nameext: ".sam".to_string(),
                 size: 4096,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );
@@ -738,6 +812,206 @@ mod tests {
         match resolved.get("aligned") {
             Some(ResolvedValue::File(fv)) => assert_eq!(fv.path, "/work/aligned.sam"),
             other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    // -- Test 8: json_to_resolved_value helper ---------------------------------
+
+    #[test]
+    fn json_to_resolved_value_primitives() {
+        let workdir = std::path::Path::new("/tmp/test_workdir");
+
+        // Null
+        let v = json_to_resolved_value(&serde_json::json!(null), workdir);
+        assert!(matches!(v, ResolvedValue::Null));
+
+        // Bool
+        let v = json_to_resolved_value(&serde_json::json!(true), workdir);
+        assert!(matches!(v, ResolvedValue::Bool(true)));
+
+        // Int
+        let v = json_to_resolved_value(&serde_json::json!(42), workdir);
+        assert!(matches!(v, ResolvedValue::Int(42)));
+
+        // Float
+        let v = json_to_resolved_value(&serde_json::json!(3.14), workdir);
+        match v {
+            ResolvedValue::Float(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("expected Float, got {:?}", other),
+        }
+
+        // String
+        let v = json_to_resolved_value(&serde_json::json!("hello"), workdir);
+        assert!(matches!(v, ResolvedValue::String(ref s) if s == "hello"));
+    }
+
+    #[test]
+    fn json_to_resolved_value_array() {
+        let workdir = std::path::Path::new("/tmp/test_workdir");
+
+        let v = json_to_resolved_value(&serde_json::json!(["echo", "hello", "world"]), workdir);
+        match v {
+            ResolvedValue::Array(arr) => {
+                assert_eq!(arr.len(), 3);
+                assert!(matches!(&arr[0], ResolvedValue::String(s) if s == "echo"));
+                assert!(matches!(&arr[1], ResolvedValue::String(s) if s == "hello"));
+                assert!(matches!(&arr[2], ResolvedValue::String(s) if s == "world"));
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_resolved_value_file_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        // Create a file so FileValue::from_path can stat it
+        let test_file = workdir.join("output.txt");
+        std::fs::write(&test_file, "content").unwrap();
+
+        let v = json_to_resolved_value(
+            &serde_json::json!({
+                "class": "File",
+                "path": test_file.to_str().unwrap()
+            }),
+            workdir,
+        );
+        match v {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.basename, "output.txt");
+                assert!(fv.path.contains("output.txt"));
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_resolved_value_relative_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        // Create a file so FileValue::from_path can stat it
+        std::fs::write(workdir.join("result.dat"), "data").unwrap();
+
+        let v = json_to_resolved_value(
+            &serde_json::json!({
+                "class": "File",
+                "path": "result.dat"
+            }),
+            workdir,
+        );
+        match v {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.basename, "result.dat");
+                assert!(fv.size > 0);
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_resolved_value_directory_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        let sub = workdir.join("outdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let v = json_to_resolved_value(
+            &serde_json::json!({
+                "class": "Directory",
+                "path": sub.to_str().unwrap()
+            }),
+            workdir,
+        );
+        match v {
+            ResolvedValue::Directory(fv) => {
+                assert_eq!(fv.basename, "outdir");
+            }
+            other => panic!("expected Directory, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_resolved_value_file_with_location_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        let test_file = workdir.join("hello.txt");
+        std::fs::write(&test_file, "hi").unwrap();
+
+        let location = format!("file://{}", test_file.to_str().unwrap());
+        let v = json_to_resolved_value(
+            &serde_json::json!({
+                "class": "File",
+                "location": location
+            }),
+            workdir,
+        );
+        match v {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.basename, "hello.txt");
+                assert!(fv.size > 0);
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn json_to_resolved_value_generic_object() {
+        let workdir = std::path::Path::new("/tmp/test_workdir");
+
+        let v = json_to_resolved_value(
+            &serde_json::json!({"key": "value", "num": 1}),
+            workdir,
+        );
+        match v {
+            ResolvedValue::String(s) => {
+                assert!(s.contains("key"));
+                assert!(s.contains("value"));
+            }
+            other => panic!("expected String (serialized JSON), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cwl_output_json_integration() {
+        // End-to-end: simulate cwl.output.json being present and parsed
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let output_json = serde_json::json!({
+            "args": ["echo", "hello", "world"]
+        });
+        std::fs::write(
+            workdir.join("cwl.output.json"),
+            serde_json::to_string(&output_json).unwrap(),
+        )
+        .unwrap();
+
+        // Verify the file is readable and parseable
+        let json_str = std::fs::read_to_string(workdir.join("cwl.output.json")).unwrap();
+        let json_val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        if let serde_json::Value::Object(map) = json_val {
+            let mut outputs = HashMap::new();
+            for (key, val) in map {
+                outputs.insert(key, json_to_resolved_value(&val, &workdir));
+            }
+            assert!(outputs.contains_key("args"));
+            match outputs.get("args") {
+                Some(ResolvedValue::Array(arr)) => {
+                    assert_eq!(arr.len(), 3);
+                    assert!(matches!(&arr[0], ResolvedValue::String(s) if s == "echo"));
+                    assert!(matches!(&arr[1], ResolvedValue::String(s) if s == "hello"));
+                    assert!(matches!(&arr[2], ResolvedValue::String(s) if s == "world"));
+                }
+                other => panic!("expected Array, got {:?}", other),
+            }
+        } else {
+            panic!("expected JSON object");
         }
     }
 }

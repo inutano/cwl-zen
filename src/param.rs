@@ -79,6 +79,9 @@ pub fn value_to_json(val: &ResolvedValue) -> serde_json::Value {
                 "nameext": &fv.nameext,
                 "size": fv.size,
             });
+            if let Some(ref cs) = fv.checksum {
+                obj["checksum"] = serde_json::json!(cs);
+            }
             if !fv.secondary_files.is_empty() {
                 obj["secondaryFiles"] = serde_json::Value::Array(
                     fv.secondary_files.iter().map(|sf| value_to_json(&ResolvedValue::File(sf.clone()))).collect()
@@ -245,6 +248,7 @@ mod tests {
                 nameroot: "sample.sorted".to_string(),
                 nameext: ".bam".to_string(),
                 size: 1024,
+                checksum: None,
                 secondary_files: Vec::new(),
             }),
         );
@@ -346,6 +350,7 @@ mod tests {
             nameroot: "input".to_string(),
             nameext: ".bam".to_string(),
             size: 512,
+            checksum: None,
             secondary_files: Vec::new(),
         });
         let result = resolve_param_refs("$(self.path)", &inputs, &runtime, Some(&self_val));
@@ -417,6 +422,7 @@ mod tests {
             nameroot: "file".to_string(),
             nameext: ".txt".to_string(),
             size: 0,
+            checksum: None,
             secondary_files: Vec::new(),
         };
         assert_eq!(
