@@ -5,4 +5,5 @@ pub mod input;
 pub mod model;
 pub mod param;
 pub mod parse;
+pub mod provenance;
 pub mod stage;
