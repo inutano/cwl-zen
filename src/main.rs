@@ -3,11 +3,13 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 
+use cwl_zen::container;
 use cwl_zen::dag;
 use cwl_zen::execute;
 use cwl_zen::input;
 use cwl_zen::model::{CwlDocument, RuntimeContext};
 use cwl_zen::parse;
+use cwl_zen::staging::StagingMode;
 
 #[derive(Parser)]
 #[command(name = "cwl-zen", version, about = "A minimal, JS-free CWL v1.2 runner")]
@@ -95,9 +97,22 @@ fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
         process::exit(1);
     }
 
+    // 4. Detect container engine
+    let engine: Box<dyn container::ContainerEngine> = match container::detect_engine() {
+        Ok(e) => e,
+        Err(_) => {
+            // Fall back to Docker if no engine detected (it will error at
+            // runtime if Docker is not installed and a container step is hit)
+            Box::new(container::OciEngine::docker())
+        }
+    };
+
+    let staging_mode = StagingMode::Symlink;
+    let no_retry_copy = false;
+
     match doc {
         CwlDocument::Workflow(wf) => {
-            // 4a. Build DAG
+            // 5a. Build DAG
             let dag_steps = match dag::build_dag(&wf) {
                 Ok(d) => d,
                 Err(e) => {
@@ -113,14 +128,22 @@ fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
             }
 
             // Execute workflow
-            let result =
-                match execute::execute_workflow(cwl_file, &wf, &dag_steps, &inputs, outdir) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Error executing workflow: {e:#}");
-                        process::exit(1);
-                    }
-                };
+            let result = match execute::execute_workflow(
+                cwl_file,
+                &wf,
+                &dag_steps,
+                &inputs,
+                outdir,
+                engine.as_ref(),
+                staging_mode,
+                no_retry_copy,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error executing workflow: {e:#}");
+                    process::exit(1);
+                }
+            };
 
             if !result.success {
                 eprintln!("Workflow execution failed");
@@ -148,14 +171,23 @@ fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
                 tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
             };
 
-            let (exit_code, outputs) =
-                match execute::execute_tool(&tool, &inputs, outdir, &runtime, &log_dir, "tool") {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Error executing tool: {e:#}");
-                        process::exit(1);
-                    }
-                };
+            let (exit_code, outputs) = match execute::execute_tool(
+                &tool,
+                &inputs,
+                outdir,
+                &runtime,
+                &log_dir,
+                "tool",
+                engine.as_ref(),
+                staging_mode,
+                no_retry_copy,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error executing tool: {e:#}");
+                    process::exit(1);
+                }
+            };
 
             // Print outputs to stderr
             for (name, val) in &outputs {

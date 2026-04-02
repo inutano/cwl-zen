@@ -1,6 +1,8 @@
 use std::path::Path;
 
+use cwl_zen::container;
 use cwl_zen::model::CwlDocument;
+use cwl_zen::staging::StagingMode;
 use cwl_zen::{dag, execute, input, parse, provenance};
 
 #[test]
@@ -28,11 +30,23 @@ fn run_two_step_workflow_with_provenance() {
     let tmpdir = tempfile::tempdir().expect("failed to create tempdir");
     let outdir = tmpdir.path().join("output");
 
-    // 5. Execute workflow
-    let run_result = execute::execute_workflow(&wf_path, &wf, &dag_steps, &inputs, &outdir)
-        .expect("execute_workflow failed");
+    // 5. Create a default container engine (Docker fallback)
+    let engine = container::OciEngine::docker();
 
-    // 6. Assert success
+    // 6. Execute workflow
+    let run_result = execute::execute_workflow(
+        &wf_path,
+        &wf,
+        &dag_steps,
+        &inputs,
+        &outdir,
+        &engine,
+        StagingMode::Symlink,
+        false,
+    )
+    .expect("execute_workflow failed");
+
+    // 7. Assert success
     assert!(run_result.success, "workflow should succeed");
     assert_eq!(run_result.steps.len(), 2, "should have 2 step results");
     for step in &run_result.steps {
@@ -43,20 +57,20 @@ fn run_two_step_workflow_with_provenance() {
         );
     }
 
-    // 7. Generate RO-Crate provenance
+    // 8. Generate RO-Crate provenance
     let crate_dir = tmpdir.path().join("ro-crate");
     provenance::generate_crate(&run_result, &crate_dir).expect("generate_crate failed");
 
-    // 8. Read ro-crate-metadata.json
+    // 9. Read ro-crate-metadata.json
     let metadata_path = crate_dir.join("ro-crate-metadata.json");
     let metadata_str =
         std::fs::read_to_string(&metadata_path).expect("failed to read ro-crate-metadata.json");
 
-    // 9. Parse as serde_json::Value
+    // 10. Parse as serde_json::Value
     let metadata: serde_json::Value =
         serde_json::from_str(&metadata_str).expect("failed to parse metadata JSON");
 
-    // 10. Verify
+    // 11. Verify
 
     // @graph is non-empty
     let graph = metadata["@graph"]

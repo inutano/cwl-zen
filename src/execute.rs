@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::command;
+use crate::container::{self, ContainerEngine, ContainerExecRequest};
 use crate::dag::DagStep;
 use crate::model::{
     CwlDocument, FileValue, ResolvedValue, RuntimeContext, StepInput, Workflow,
@@ -14,6 +15,7 @@ use crate::model::{
 use crate::param;
 use crate::parse;
 use crate::stage;
+use crate::staging::{self, StagingMode};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -54,13 +56,15 @@ pub struct StepResult {
 /// Execute a single CommandLineTool step.
 ///
 /// 1. Create workdir and log_dir
-/// 2. Build command via `command::build_command()`
-/// 3. Set up stdout/stderr log files
-/// 4. Run via Docker (if docker_image set) or directly
-/// 5. Capture exit code
-/// 6. Handle stdout redirect
-/// 7. Collect outputs via `stage::collect_outputs()`
-/// 8. Return (exit_code, outputs)
+/// 2. Stage inputs into workdir
+/// 3. Build command via `command::build_command()` using staged inputs
+/// 4. Set up stdout/stderr log files
+/// 5. Run via ContainerEngine (if docker_image set) or directly
+/// 6. Capture exit code
+/// 7. Auto-retry with copy staging if symlink failure detected
+/// 8. Handle stdout redirect
+/// 9. Collect outputs via `stage::collect_outputs()`
+/// 10. Return (exit_code, outputs)
 pub fn execute_tool(
     tool: &crate::model::CommandLineTool,
     inputs: &HashMap<String, ResolvedValue>,
@@ -68,6 +72,9 @@ pub fn execute_tool(
     runtime: &RuntimeContext,
     log_dir: &Path,
     step_name: &str,
+    engine: &dyn ContainerEngine,
+    staging_mode: StagingMode,
+    no_retry_copy: bool,
 ) -> Result<(i32, HashMap<String, ResolvedValue>)> {
     // 1. Create workdir and log_dir
     fs::create_dir_all(workdir)
@@ -75,48 +82,47 @@ pub fn execute_tool(
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log_dir: {}", log_dir.display()))?;
 
-    // 2. Build command
-    let resolved_cmd = command::build_command(tool, inputs, runtime);
+    // 2. Stage inputs into workdir
+    let staged_inputs = staging::stage_inputs(inputs, workdir, staging_mode)?;
 
-    // 3. Set up log files
+    // 3. Build command using staged inputs
+    let resolved_cmd = command::build_command(tool, &staged_inputs, runtime);
+
+    // 4. Set up log files
     let stdout_log = log_dir.join(format!("{}.stdout.log", step_name));
     let stderr_log = log_dir.join(format!("{}.stderr.log", step_name));
 
-    // 4 & 5. Execute the command
-    let exit_code = if let Some(ref docker_image) = resolved_cmd.docker_image {
-        // Docker execution
-        let mounts = stage::build_docker_mounts(inputs, workdir);
-        let mut cmd = Command::new("docker");
-        cmd.arg("run").arg("--rm").arg("--workdir=/work");
+    // 5 & 6. Execute the command
+    let exit_code = if let Some(ref image) = resolved_cmd.docker_image {
+        // Pull image
+        let cache_dir = container::resolve_container_cache(None);
+        engine.pull(image, &cache_dir)?;
 
-        for mount_arg in &mounts {
-            cmd.arg(mount_arg);
-        }
+        // Build mounts
+        let mounts = container::build_mounts(&staged_inputs, workdir);
 
-        cmd.arg(docker_image);
-
-        if resolved_cmd.use_shell {
-            cmd.arg("sh").arg("-c").arg(&resolved_cmd.command_line);
-        } else {
-            for part in resolved_cmd.command_line.split_whitespace() {
-                cmd.arg(part);
-            }
-        }
-
+        // Execute via engine
         let stdout_file = fs::File::create(&stdout_log)
             .with_context(|| format!("creating stdout log: {}", stdout_log.display()))?;
         let stderr_file = fs::File::create(&stderr_log)
             .with_context(|| format!("creating stderr log: {}", stderr_log.display()))?;
 
-        cmd.stdout(stdout_file).stderr(stderr_file);
-        cmd.current_dir(workdir);
-
-        let status = cmd
-            .status()
-            .with_context(|| format!("running docker command for step '{}'", step_name))?;
+        let req = ContainerExecRequest {
+            image: image.clone(),
+            command: resolved_cmd.command_line.clone(),
+            use_shell: resolved_cmd.use_shell,
+            workdir: workdir.to_path_buf(),
+            mounts,
+            network: resolved_cmd.network_access,
+            cores: resolved_cmd.cores,
+            ram: resolved_cmd.ram,
+            stdout: stdout_file,
+            stderr: stderr_file,
+        };
+        let status = engine.exec(req)?;
         status.code().unwrap_or(1)
     } else {
-        // Direct execution (no Docker)
+        // Direct execution (no container)
         let mut cmd = if resolved_cmd.use_shell {
             let mut c = Command::new("sh");
             c.arg("-c").arg(&resolved_cmd.command_line);
@@ -147,7 +153,44 @@ pub fn execute_tool(
         status.code().unwrap_or(1)
     };
 
-    // 6. If stdout redirect: copy stdout log to workdir/{stdout_file}
+    // 7. Auto-retry with copy staging if symlink failure detected
+    if exit_code != 0 && !no_retry_copy && staging_mode == StagingMode::Symlink {
+        let stderr_content = fs::read_to_string(&stderr_log).unwrap_or_default();
+        if staging::is_symlink_error(&stderr_content) {
+            eprintln!(
+                "Step '{}' failed with possible symlink error. Retrying with copy-staged inputs...",
+                step_name
+            );
+
+            // Create a new workdir for the retry
+            let retry_workdir = workdir
+                .parent()
+                .unwrap_or(workdir)
+                .join(format!("{}_copy_retry", step_name));
+            fs::create_dir_all(&retry_workdir)?;
+
+            // Re-run with Copy mode and no_retry_copy=true to avoid infinite recursion
+            let (retry_exit_code, retry_outputs) = execute_tool(
+                tool,
+                inputs,
+                &retry_workdir,
+                runtime,
+                log_dir,
+                &format!("{}_retry", step_name),
+                engine,
+                StagingMode::Copy,
+                true,
+            )?;
+
+            if retry_exit_code == 0 {
+                eprintln!("Step '{}' succeeded after copy-staging.", step_name);
+            }
+
+            return Ok((retry_exit_code, retry_outputs));
+        }
+    }
+
+    // 8. If stdout redirect: copy stdout log to workdir/{stdout_file}
     if let Some(ref stdout_filename) = resolved_cmd.stdout_file {
         let dest = workdir.join(stdout_filename);
         fs::copy(&stdout_log, &dest).with_context(|| {
@@ -159,10 +202,10 @@ pub fn execute_tool(
         })?;
     }
 
-    // 7. Collect outputs
-    let outputs = stage::collect_outputs(tool, inputs, runtime, workdir)?;
+    // 9. Collect outputs
+    let outputs = stage::collect_outputs(tool, &staged_inputs, runtime, workdir)?;
 
-    // 8. Return
+    // 10. Return
     Ok((exit_code, outputs))
 }
 
@@ -173,6 +216,9 @@ pub fn execute_workflow(
     dag: &[DagStep],
     inputs: &HashMap<String, ResolvedValue>,
     outdir: &Path,
+    engine: &dyn ContainerEngine,
+    staging_mode: StagingMode,
+    no_retry_copy: bool,
 ) -> Result<RunResult> {
     let start_time = Utc::now();
 
@@ -182,6 +228,17 @@ pub fn execute_workflow(
     let log_dir = outdir.join("logs");
     fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log dir: {}", log_dir.display()))?;
+
+    // Merge workflow defaults: if an input is not provided, use the workflow
+    // input's default value (if declared).
+    let mut inputs = inputs.clone();
+    for (name, wf_input) in &workflow.inputs {
+        if !inputs.contains_key(name) {
+            if let Some(default) = &wf_input.default {
+                inputs.insert(name.clone(), yaml_to_resolved(default));
+            }
+        }
+    }
 
     // Resolve the workflow's parent directory for relative tool paths
     let wf_dir = workflow_path
@@ -213,7 +270,7 @@ pub fn execute_workflow(
             .with_context(|| format!("step '{}' not found in workflow", step_name))?;
         let step_inputs = resolve_step_inputs(
             &wf_step.inputs,
-            inputs,
+            &inputs,
             &step_outputs,
             &RuntimeContext {
                 cores: 1,
@@ -233,8 +290,17 @@ pub fn execute_workflow(
         };
 
         // d. Execute the tool
-        let (exit_code, outputs) =
-            execute_tool(&tool, &step_inputs, &step_workdir, &runtime, &log_dir, step_name)?;
+        let (exit_code, outputs) = execute_tool(
+            &tool,
+            &step_inputs,
+            &step_workdir,
+            &runtime,
+            &log_dir,
+            step_name,
+            engine,
+            staging_mode,
+            no_retry_copy,
+        )?;
 
         let step_end = Utc::now();
         let container_image = parse::docker_image(&tool);
@@ -267,7 +333,7 @@ pub fn execute_workflow(
     let mut wf_outputs = HashMap::new();
     for (out_name, out_def) in &workflow.outputs {
         if let Some(ref source) = out_def.output_source {
-            let resolved = resolve_source(source, inputs, &step_outputs);
+            let resolved = resolve_source(source, &inputs, &step_outputs);
             wf_outputs.insert(out_name.clone(), resolved);
         } else {
             wf_outputs.insert(out_name.clone(), ResolvedValue::Null);
@@ -301,7 +367,7 @@ pub fn execute_workflow(
     Ok(RunResult {
         workflow_path: workflow_path.to_path_buf(),
         workflow: workflow.clone(),
-        inputs: inputs.clone(),
+        inputs,
         outputs: wf_outputs,
         steps: step_results,
         start_time,
@@ -373,7 +439,8 @@ fn resolve_step_inputs(
                         .unwrap_or(ResolvedValue::Null)
                 };
 
-                // If value_from is set, resolve it
+                // If value_from is set, resolve it using wf_inputs as the
+                // inputs context (so $(inputs.x) references work).
                 if let Some(ref vf) = entry.value_from {
                     let resolved_str =
                         param::resolve_param_refs(vf, wf_inputs, runtime, Some(&base_value));
