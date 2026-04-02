@@ -753,6 +753,7 @@ mod tests {
         inputs.insert(
             "sample_id".to_string(),
             WorkflowInput {
+                id: None,
                 cwl_type: CwlType::Single("string".to_string()),
                 secondary_files: Vec::new(),
                 doc: None,
@@ -762,6 +763,7 @@ mod tests {
         inputs.insert(
             "reads".to_string(),
             WorkflowInput {
+                id: None,
                 cwl_type: CwlType::Single("File".to_string()),
                 secondary_files: Vec::new(),
                 doc: None,
@@ -773,6 +775,7 @@ mod tests {
         outputs.insert(
             "bam".to_string(),
             WorkflowOutput {
+                id: None,
                 cwl_type: CwlType::Single("File".to_string()),
                 output_source: Some("align/aligned_bam".to_string()),
                 doc: None,

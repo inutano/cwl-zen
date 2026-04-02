@@ -95,6 +95,42 @@ pub fn has_network_access(tool: &CommandLineTool) -> bool {
     })
 }
 
+/// Extract InitialWorkDirRequirement listing entries from a CommandLineTool.
+///
+/// Returns a vec of `(entryname, entry_content)` pairs. Each entry has an
+/// `entryname` (the filename to create) and `entry` (the content, which may
+/// contain `$(inputs.X)` parameter references).
+pub fn initial_workdir_listing(tool: &CommandLineTool) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for entry in &tool.requirements {
+        if let Some(class) = entry.get("class").and_then(|v| v.as_str()) {
+            if class == "InitialWorkDirRequirement" {
+                if let Some(listing) = entry.get("listing") {
+                    if let Some(items) = listing.as_sequence() {
+                        for item in items {
+                            let entryname = item
+                                .get("entryname")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let entry_content = item
+                                .get("entry")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !entryname.is_empty() && !entry_content.is_empty() {
+                                result.push((
+                                    entryname.to_string(),
+                                    entry_content.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -316,5 +352,149 @@ outputs: {}
         let yaml = "#!/usr/bin/env cwl-runner\nclass: CommandLineTool\nbaseCommand: echo\ninputs: {}\noutputs: {}\n";
         let doc = parse_cwl_str(yaml).unwrap();
         assert!(matches!(doc, CwlDocument::CommandLineTool(_)));
+    }
+
+    #[test]
+    fn parse_initial_workdir_listing() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+requirements:
+  - class: InitialWorkDirRequirement
+    listing:
+      - entryname: config.txt
+        entry: "threads=$(inputs.count)"
+      - entryname: run.sh
+        entry: "echo hello"
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let listing = initial_workdir_listing(&tool);
+                assert_eq!(listing.len(), 2);
+                assert_eq!(listing[0].0, "config.txt");
+                assert_eq!(listing[0].1, "threads=$(inputs.count)");
+                assert_eq!(listing[1].0, "run.sh");
+                assert_eq!(listing[1].1, "echo hello");
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_initial_workdir_listing_empty() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let listing = initial_workdir_listing(&tool);
+                assert!(listing.is_empty());
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_map_form_requirements_docker_image() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+requirements:
+  DockerRequirement:
+    dockerPull: ubuntu:22.04
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert_eq!(docker_image(&tool), Some("ubuntu:22.04".to_string()));
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_map_form_resource_requirement() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+requirements:
+  ResourceRequirement:
+    coresMin: 8
+    ramMin: 4096
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let (cores, ram) = resource_requirement(&tool);
+                assert_eq!(cores, 8);
+                assert_eq!(ram, 4096);
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_list_form_tool_inputs() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: bwa
+inputs:
+  - id: reference
+    type: File
+    inputBinding: { position: 2 }
+  - id: reads
+    type:
+      type: array
+      items: File
+    inputBinding: { position: 3 }
+outputs: {}
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert!(tool.inputs.contains_key("reference"));
+                assert!(tool.inputs.contains_key("reads"));
+                assert_eq!(tool.inputs["reference"].cwl_type.base_type(), "File");
+                assert!(tool.inputs["reads"].cwl_type.is_array());
+                assert_eq!(tool.inputs["reads"].cwl_type.base_type(), "File");
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
+    }
+
+    #[test]
+    fn parse_initial_workdir_listing_map_form() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+requirements:
+  InitialWorkDirRequirement:
+    listing:
+      - entryname: script.sh
+        entry: "echo $(inputs.msg)"
+"#;
+        let doc = parse_cwl_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let listing = initial_workdir_listing(&tool);
+                assert_eq!(listing.len(), 1);
+                assert_eq!(listing[0].0, "script.sh");
+                assert_eq!(listing[0].1, "echo $(inputs.msg)");
+            }
+            _ => panic!("expected CommandLineTool"),
+        }
     }
 }

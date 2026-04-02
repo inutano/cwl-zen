@@ -201,9 +201,10 @@ mod tests {
             );
         }
         WorkflowStep {
+            id: None,
             run: run.to_string(),
             inputs,
-            out: vec!["output".to_string()],
+            out: StepOutputList(vec!["output".to_string()]),
             scatter: None,
             scatter_method: None,
         }

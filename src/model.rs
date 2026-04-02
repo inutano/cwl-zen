@@ -1,6 +1,138 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// Trait for types that carry an `id` field (used for list→map conversion)
+// ---------------------------------------------------------------------------
+
+pub trait HasId {
+    fn take_id(&mut self) -> Option<String>;
+}
+
+// ---------------------------------------------------------------------------
+// Custom deserializer: map-or-list for inputs/outputs/steps
+// ---------------------------------------------------------------------------
+
+/// Deserialize a field that may be either:
+/// - A YAML mapping `{key: value, ...}` → `HashMap<String, V>`
+/// - A YAML sequence `[{id: key, ...}, ...]` → `HashMap<String, V>` keyed by `id`
+pub fn deserialize_map_or_list<'de, D, V>(deserializer: D) -> Result<HashMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de> + HasId,
+{
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+    use std::marker::PhantomData;
+
+    struct MapOrListVisitor<V>(PhantomData<V>);
+
+    impl<'de, V> Visitor<'de> for MapOrListVisitor<V>
+    where
+        V: Deserialize<'de> + HasId,
+    {
+        type Value = HashMap<String, V>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a map or a list of objects with 'id' fields")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut result = HashMap::new();
+            while let Some((key, value)) = map.next_entry::<String, V>()? {
+                result.insert(key, value);
+            }
+            Ok(result)
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let mut result = HashMap::new();
+            while let Some(mut item) = seq.next_element::<V>()? {
+                let id = item.take_id().ok_or_else(|| {
+                    de::Error::custom("list-form entry missing required 'id' field")
+                })?;
+                result.insert(id, item);
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_any(MapOrListVisitor(PhantomData))
+}
+
+// ---------------------------------------------------------------------------
+// Custom deserializer: list-or-map for requirements/hints
+// ---------------------------------------------------------------------------
+
+/// Deserialize requirements/hints that may be either:
+/// - A YAML sequence `[{class: X, ...}, ...]` (current/standard form)
+/// - A YAML mapping `{X: {...}, ...}` → converted to `[{class: X, ...}, ...]`
+pub fn deserialize_requirements<'de, D>(
+    deserializer: D,
+) -> Result<Vec<serde_yaml::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct ReqVisitor;
+
+    impl<'de> Visitor<'de> for ReqVisitor {
+        type Value = Vec<serde_yaml::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a list or map of requirements")
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let mut result = Vec::new();
+            while let Some(item) = seq.next_element::<serde_yaml::Value>()? {
+                result.push(item);
+            }
+            Ok(result)
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut result = Vec::new();
+            while let Some((key, value)) =
+                map.next_entry::<String, serde_yaml::Value>()?
+            {
+                let mut mapping = match value {
+                    serde_yaml::Value::Mapping(m) => m,
+                    serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+                    other => {
+                        return Err(de::Error::custom(format!(
+                            "expected mapping for requirement '{}', got {:?}",
+                            key, other
+                        )));
+                    }
+                };
+                mapping.insert(
+                    serde_yaml::Value::String("class".to_string()),
+                    serde_yaml::Value::String(key),
+                );
+                result.push(serde_yaml::Value::Mapping(mapping));
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_any(ReqVisitor)
+}
 
 // ---------------------------------------------------------------------------
 // Top-level CWL document
@@ -36,20 +168,23 @@ pub struct CommandLineTool {
     #[serde(default)]
     pub arguments: Vec<Argument>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
     pub inputs: HashMap<String, ToolInput>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
     pub outputs: HashMap<String, ToolOutput>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_requirements")]
     pub requirements: Vec<serde_yaml::Value>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_requirements")]
     pub hints: Vec<serde_yaml::Value>,
 
     #[serde(default)]
     pub stdout: Option<String>,
+
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +236,9 @@ pub struct ArgumentEntry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInput {
+    #[serde(default)]
+    pub id: Option<String>,
+
     #[serde(rename = "type")]
     pub cwl_type: CwlType,
 
@@ -115,6 +253,12 @@ pub struct ToolInput {
 
     #[serde(default)]
     pub default: Option<serde_yaml::Value>,
+}
+
+impl HasId for ToolInput {
+    fn take_id(&mut self) -> Option<String> {
+        self.id.take()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,6 +278,9 @@ pub struct InputBinding {
 
     #[serde(default)]
     pub value_from: Option<String>,
+
+    #[serde(default)]
+    pub item_separator: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +290,9 @@ pub struct InputBinding {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolOutput {
+    #[serde(default)]
+    pub id: Option<String>,
+
     #[serde(rename = "type")]
     pub cwl_type: CwlType,
 
@@ -154,6 +304,12 @@ pub struct ToolOutput {
 
     #[serde(default)]
     pub doc: Option<String>,
+}
+
+impl HasId for ToolOutput {
+    fn take_id(&mut self) -> Option<String> {
+        self.id.take()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -182,17 +338,93 @@ pub enum GlobPattern {
 // CwlType — single string or array of strings (for union types)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Serialize)]
 pub enum CwlType {
+    /// A simple type string: "File", "string", "int", "File?", "File[]"
     Single(String),
-    Array(Vec<String>),
+    /// A union type: ["null", "File"]
+    Union(Vec<CwlType>),
+    /// A structured array type: {type: array, items: File}
+    ArrayType { items: Box<CwlType> },
+}
+
+impl<'de> Deserialize<'de> for CwlType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct CwlTypeVisitor;
+
+        impl<'de> Visitor<'de> for CwlTypeVisitor {
+            type Value = CwlType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a CWL type (string, array, or {type: array, items: ...})")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<CwlType, E> {
+                Ok(CwlType::Single(v.to_string()))
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<CwlType, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<CwlType>()? {
+                    items.push(item);
+                }
+                Ok(CwlType::Union(items))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<CwlType, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                // Parse {type: "array", items: <CwlType>}
+                let mut type_field: Option<String> = None;
+                let mut items_field: Option<CwlType> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "type" => {
+                            type_field = Some(map.next_value()?);
+                        }
+                        "items" => {
+                            items_field = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _: serde_yaml::Value = map.next_value()?;
+                        }
+                    }
+                }
+
+                match (type_field.as_deref(), items_field) {
+                    (Some("array"), Some(items)) => {
+                        Ok(CwlType::ArrayType {
+                            items: Box::new(items),
+                        })
+                    }
+                    (Some(t), _) => {
+                        // Other structured types - just return as single
+                        Ok(CwlType::Single(t.to_string()))
+                    }
+                    _ => Err(de::Error::custom("structured type missing 'type' field")),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(CwlTypeVisitor)
+    }
 }
 
 impl CwlType {
     /// Return the base type name, stripping optional "?" suffix and "[]" array
     /// suffix. For union arrays like `["null", "File"]`, return the first
-    /// non-"null" element.
+    /// non-"null" element. For structured array types, return the items type.
     pub fn base_type(&self) -> &str {
         match self {
             CwlType::Single(s) => {
@@ -200,15 +432,16 @@ impl CwlType {
                 let s = s.trim_end_matches("[]");
                 s
             }
-            CwlType::Array(v) => {
+            CwlType::Union(v) => {
                 for item in v {
-                    if item != "null" {
-                        return item.as_str();
+                    match item {
+                        CwlType::Single(s) if s == "null" => continue,
+                        other => return other.base_type(),
                     }
                 }
-                // Degenerate case: all null
                 "null"
             }
+            CwlType::ArrayType { items } => items.base_type(),
         }
     }
 
@@ -219,15 +452,19 @@ impl CwlType {
     pub fn is_optional(&self) -> bool {
         match self {
             CwlType::Single(s) => s.ends_with('?'),
-            CwlType::Array(v) => v.iter().any(|item| item == "null"),
+            CwlType::Union(v) => v.iter().any(|item| {
+                matches!(item, CwlType::Single(s) if s == "null")
+            }),
+            CwlType::ArrayType { .. } => false,
         }
     }
 
-    /// Returns true if the type represents an array type (e.g. `"File[]"`).
+    /// Returns true if the type represents an array type (e.g. `"File[]"` or `{type: array, items: File}`).
     pub fn is_array(&self) -> bool {
         match self {
             CwlType::Single(s) => s.ends_with("[]"),
-            CwlType::Array(_) => false,
+            CwlType::Union(_) => false,
+            CwlType::ArrayType { .. } => true,
         }
     }
 }
@@ -267,16 +504,16 @@ pub struct Workflow {
     #[serde(default)]
     pub doc: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
     pub inputs: HashMap<String, WorkflowInput>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
     pub outputs: HashMap<String, WorkflowOutput>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
     pub steps: HashMap<String, WorkflowStep>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_requirements")]
     pub requirements: Vec<serde_yaml::Value>,
 }
 
@@ -287,6 +524,9 @@ pub struct Workflow {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowInput {
+    #[serde(default)]
+    pub id: Option<String>,
+
     #[serde(rename = "type")]
     pub cwl_type: CwlType,
 
@@ -300,9 +540,18 @@ pub struct WorkflowInput {
     pub default: Option<serde_yaml::Value>,
 }
 
+impl HasId for WorkflowInput {
+    fn take_id(&mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowOutput {
+    #[serde(default)]
+    pub id: Option<String>,
+
     #[serde(rename = "type")]
     pub cwl_type: CwlType,
 
@@ -313,6 +562,12 @@ pub struct WorkflowOutput {
     pub doc: Option<String>,
 }
 
+impl HasId for WorkflowOutput {
+    fn take_id(&mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Workflow steps
 // ---------------------------------------------------------------------------
@@ -320,13 +575,16 @@ pub struct WorkflowOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowStep {
+    #[serde(default)]
+    pub id: Option<String>,
+
     pub run: String,
 
-    #[serde(rename = "in", default)]
+    #[serde(rename = "in", default, deserialize_with = "deserialize_map_or_list")]
     pub inputs: HashMap<String, StepInput>,
 
     #[serde(default)]
-    pub out: Vec<String>,
+    pub out: StepOutputList,
 
     #[serde(default)]
     pub scatter: Option<ScatterField>,
@@ -335,17 +593,109 @@ pub struct WorkflowStep {
     pub scatter_method: Option<String>,
 }
 
+impl HasId for WorkflowStep {
+    fn take_id(&mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
+/// Step `out` can be a list of plain strings or a list of `{id: ...}` objects.
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+pub struct StepOutputList(pub Vec<String>);
+
+impl std::ops::Deref for StepOutputList {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StepOutputList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{SeqAccess, Visitor};
+        use std::fmt;
+
+        struct StepOutVisitor;
+
+        impl<'de> Visitor<'de> for StepOutVisitor {
+            type Value = StepOutputList;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a list of strings or objects with 'id' fields")
+            }
+
+            fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+            where
+                S: SeqAccess<'de>,
+            {
+                let mut result = Vec::new();
+                while let Some(item) = seq.next_element::<serde_yaml::Value>()? {
+                    match item {
+                        serde_yaml::Value::String(s) => result.push(s),
+                        serde_yaml::Value::Mapping(m) => {
+                            if let Some(serde_yaml::Value::String(id)) =
+                                m.get(&serde_yaml::Value::String("id".to_string()))
+                            {
+                                result.push(id.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(StepOutputList(result))
+            }
+        }
+
+        deserializer.deserialize_seq(StepOutVisitor)
+    }
+}
+
 /// A step input can be a simple source string or a structured entry.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Serialize)]
 pub enum StepInput {
     Source(String),
     Structured(StepInputEntry),
 }
 
+impl<'de> Deserialize<'de> for StepInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match &value {
+            serde_yaml::Value::String(s) => Ok(StepInput::Source(s.clone())),
+            serde_yaml::Value::Mapping(_) => {
+                let entry: StepInputEntry =
+                    serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(StepInput::Structured(entry))
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "expected string or mapping for step input, got {:?}",
+                value
+            ))),
+        }
+    }
+}
+
+impl HasId for StepInput {
+    fn take_id(&mut self) -> Option<String> {
+        match self {
+            StepInput::Structured(entry) => entry.id.take(),
+            StepInput::Source(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepInputEntry {
+    #[serde(default)]
+    pub id: Option<String>,
+
     #[serde(default)]
     pub source: Option<String>,
 
@@ -464,7 +814,10 @@ mod tests {
 
     #[test]
     fn base_type_union_array() {
-        let t = CwlType::Array(vec!["null".to_string(), "File".to_string()]);
+        let t = CwlType::Union(vec![
+            CwlType::Single("null".to_string()),
+            CwlType::Single("File".to_string()),
+        ]);
         assert_eq!(t.base_type(), "File");
     }
 
@@ -484,7 +837,10 @@ mod tests {
 
     #[test]
     fn is_optional_union_with_null() {
-        let t = CwlType::Array(vec!["null".to_string(), "File".to_string()]);
+        let t = CwlType::Union(vec![
+            CwlType::Single("null".to_string()),
+            CwlType::Single("File".to_string()),
+        ]);
         assert!(t.is_optional());
     }
 
@@ -581,9 +937,260 @@ steps:
                 assert!(wf.steps.contains_key("step1"));
                 let step = &wf.steps["step1"];
                 assert_eq!(step.run, "tool.cwl");
-                assert_eq!(step.out, vec!["result"]);
+                assert_eq!(*step.out, vec!["result"]);
             }
             _ => panic!("Expected Workflow"),
+        }
+    }
+
+    // -- List-form inputs/outputs (Bug 1) -----------------------------------
+
+    #[test]
+    fn deserialize_list_form_inputs_outputs() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  - id: reference
+    type: File
+    inputBinding: { position: 1 }
+  - id: message
+    type: string
+outputs:
+  - id: sam
+    type: File
+    outputBinding: { glob: output.sam }
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert!(tool.inputs.contains_key("reference"));
+                assert!(tool.inputs.contains_key("message"));
+                assert_eq!(tool.inputs["reference"].cwl_type.base_type(), "File");
+                assert_eq!(tool.inputs["message"].cwl_type.base_type(), "string");
+                assert!(tool.outputs.contains_key("sam"));
+                assert_eq!(tool.outputs["sam"].cwl_type.base_type(), "File");
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Structured array type {type: array, items: File} (Bug 1) -----------
+
+    #[test]
+    fn deserialize_structured_array_type() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  - id: reads
+    type:
+      type: array
+      items: File
+    inputBinding: { position: 1 }
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let reads = tool.inputs.get("reads").expect("missing input 'reads'");
+                assert_eq!(reads.cwl_type.base_type(), "File");
+                assert!(reads.cwl_type.is_array());
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Inline structured array type {type: array, items: int} -------------
+
+    #[test]
+    fn deserialize_inline_structured_array_type() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  - id: counts
+    type: { type: array, items: int }
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let counts = tool.inputs.get("counts").expect("missing input 'counts'");
+                assert_eq!(counts.cwl_type.base_type(), "int");
+                assert!(counts.cwl_type.is_array());
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Union type with structured array: ["null", {type: array, items: string}]
+
+    #[test]
+    fn deserialize_union_with_structured_array() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs:
+  - id: tags
+    type:
+      - "null"
+      - type: array
+        items: string
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let tags = tool.inputs.get("tags").expect("missing input 'tags'");
+                assert!(tags.cwl_type.is_optional());
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Map-form requirements (Bug 2) --------------------------------------
+
+    #[test]
+    fn deserialize_map_form_requirements() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+requirements:
+  ResourceRequirement:
+    coresMin: 4
+  ShellCommandRequirement: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert_eq!(tool.requirements.len(), 2);
+                // Check that the class field was injected
+                let classes: Vec<String> = tool.requirements.iter().filter_map(|r| {
+                    r.get("class").and_then(|v| v.as_str()).map(|s| s.to_string())
+                }).collect();
+                assert!(classes.contains(&"ResourceRequirement".to_string()));
+                assert!(classes.contains(&"ShellCommandRequirement".to_string()));
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Map-form hints (Bug 2) ---------------------------------------------
+
+    #[test]
+    fn deserialize_map_form_hints() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+hints:
+  DockerRequirement:
+    dockerPull: ubuntu:22.04
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert_eq!(tool.hints.len(), 1);
+                let class = tool.hints[0].get("class").and_then(|v| v.as_str());
+                assert_eq!(class, Some("DockerRequirement"));
+                let pull = tool.hints[0].get("dockerPull").and_then(|v| v.as_str());
+                assert_eq!(pull, Some("ubuntu:22.04"));
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Union output type: ["null", File] ----------------------------------
+
+    #[test]
+    fn deserialize_union_output_type() {
+        let yaml = r#"
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs:
+  - id: sam
+    type: ["null", File]
+    outputBinding: { glob: output.sam }
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                let sam = tool.outputs.get("sam").expect("missing output 'sam'");
+                assert!(sam.cwl_type.is_optional());
+                assert_eq!(sam.cwl_type.base_type(), "File");
+            }
+            _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- bwa-mem-tool.cwl style (full conformance test format) ---------------
+
+    #[test]
+    fn deserialize_bwa_mem_tool_style() {
+        let yaml = r#"
+class: CommandLineTool
+cwlVersion: v1.2
+hints:
+  - class: ResourceRequirement
+    coresMin: 2
+  - class: DockerRequirement
+    dockerPull: docker.io/python:3-slim
+inputs:
+  - id: reference
+    type: File
+    inputBinding: { position: 2 }
+  - id: reads
+    type:
+      type: array
+      items: File
+    inputBinding: { position: 3 }
+  - id: minimum_seed_length
+    type: int
+    inputBinding: { position: 1, prefix: -m }
+  - id: min_std_max_min
+    type: { type: array, items: int }
+    inputBinding:
+      position: 1
+      prefix: -I
+      itemSeparator: ","
+outputs:
+  - id: sam
+    type: ["null", File]
+    outputBinding: { glob: output.sam }
+  - id: args
+    type:
+      type: array
+      items: string
+baseCommand: python
+arguments:
+  - bwa
+  - mem
+stdout: output.sam
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::CommandLineTool(tool) => {
+                assert_eq!(tool.inputs.len(), 4);
+                assert_eq!(tool.outputs.len(), 2);
+                assert!(tool.inputs.contains_key("reference"));
+                assert!(tool.inputs.contains_key("reads"));
+                assert!(tool.inputs.contains_key("minimum_seed_length"));
+                assert!(tool.inputs.contains_key("min_std_max_min"));
+                // Check reads is array type
+                assert!(tool.inputs["reads"].cwl_type.is_array());
+                assert_eq!(tool.inputs["reads"].cwl_type.base_type(), "File");
+                // Check min_std_max_min has itemSeparator
+                let binding = tool.inputs["min_std_max_min"].input_binding.as_ref().unwrap();
+                assert_eq!(binding.item_separator, Some(",".to_string()));
+                // Check output union type
+                assert!(tool.outputs["sam"].cwl_type.is_optional());
+            }
+            _ => panic!("Expected CommandLineTool"),
         }
     }
 }

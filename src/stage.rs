@@ -281,6 +281,7 @@ mod tests {
         outputs.insert(
             "outfile".to_string(),
             ToolOutput {
+                id: None,
                 cwl_type: CwlType::Single("File".to_string()),
                 output_binding: Some(OutputBinding {
                     glob: GlobPattern::Single("*.txt".to_string()),
@@ -301,6 +302,7 @@ mod tests {
             requirements: Vec::new(),
             hints: Vec::new(),
             stdout: None,
+            stdin: None,
         };
 
         let inputs = HashMap::new();

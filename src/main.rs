@@ -130,11 +130,19 @@ fn cmd_run(
         }
     };
 
-    // 3. Create outdir
+    // 3. Create outdir and canonicalize to absolute path (fixes Docker bind mounts with relative paths)
     if let Err(e) = std::fs::create_dir_all(outdir) {
         eprintln!("Error creating output directory: {e}");
         process::exit(1);
     }
+    let outdir = match std::fs::canonicalize(outdir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error resolving output directory: {e}");
+            process::exit(1);
+        }
+    };
+    let outdir = outdir.as_path();
 
     // 4. Resolve container cache directory
     let _cache_dir = container::resolve_container_cache(container_cache);

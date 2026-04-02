@@ -85,6 +85,19 @@ pub fn execute_tool(
     // 2. Stage inputs into workdir
     let staged_inputs = staging::stage_inputs(inputs, workdir, staging_mode)?;
 
+    // 2b. Materialize InitialWorkDirRequirement listing entries
+    for (name, content) in parse::initial_workdir_listing(tool) {
+        let resolved = param::resolve_param_refs(&content, &staged_inputs, runtime, None);
+        let path = workdir.join(&name);
+        fs::write(&path, &resolved).with_context(|| {
+            format!(
+                "writing InitialWorkDirRequirement entry '{}' to {}",
+                name,
+                path.display()
+            )
+        })?;
+    }
+
     // 3. Build command using staged inputs
     let resolved_cmd = command::build_command(tool, &staged_inputs, runtime);
 
@@ -596,6 +609,7 @@ mod tests {
         step_in.insert(
             "threads".to_string(),
             StepInput::Structured(StepInputEntry {
+                id: None,
                 source: None,
                 value_from: None,
                 default: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
@@ -627,6 +641,7 @@ mod tests {
         step_in.insert(
             "greeting".to_string(),
             StepInput::Structured(StepInputEntry {
+                id: None,
                 source: Some("message".to_string()),
                 value_from: Some("prefix_$(self)".to_string()),
                 default: None,
