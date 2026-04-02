@@ -1,3 +1,222 @@
+use std::path::PathBuf;
+use std::process;
+
+use clap::{Parser, Subcommand};
+
+use cwl_zen::dag;
+use cwl_zen::execute;
+use cwl_zen::input;
+use cwl_zen::model::{CwlDocument, RuntimeContext};
+use cwl_zen::parse;
+
+#[derive(Parser)]
+#[command(name = "cwl-zen", version, about = "A minimal, JS-free CWL v1.2 runner")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Execute a CWL workflow or tool
+    Run {
+        /// Path to the CWL file
+        cwl_file: PathBuf,
+
+        /// Path to the input YAML file
+        input_file: PathBuf,
+
+        /// Output directory (default: ./cwl-zen-output)
+        #[arg(long, default_value = "./cwl-zen-output")]
+        outdir: PathBuf,
+
+        /// Skip RO-Crate provenance generation
+        #[arg(long)]
+        no_crate: bool,
+    },
+
+    /// Validate one or more CWL files
+    Validate {
+        /// CWL files to validate
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+
+    /// Print the execution DAG for a workflow
+    Dag {
+        /// Path to the CWL workflow file
+        cwl_file: PathBuf,
+    },
+}
+
 fn main() {
-    println!("cwl-zen: not yet implemented");
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Run {
+            cwl_file,
+            input_file,
+            outdir,
+            no_crate,
+        } => cmd_run(&cwl_file, &input_file, &outdir, no_crate),
+
+        Commands::Validate { files } => cmd_validate(&files),
+
+        Commands::Dag { cwl_file } => cmd_dag(&cwl_file),
+    }
+}
+
+fn cmd_run(cwl_file: &PathBuf, input_file: &PathBuf, outdir: &PathBuf, _no_crate: bool) {
+    // 1. Parse CWL file
+    let doc = match parse::parse_cwl(cwl_file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error parsing CWL file: {e:#}");
+            process::exit(1);
+        }
+    };
+
+    // 2. Parse input YAML (base_dir = input_file's parent)
+    let base_dir = input_file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let inputs = match input::parse_inputs(input_file, &base_dir) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("Error parsing input file: {e:#}");
+            process::exit(1);
+        }
+    };
+
+    // 3. Create outdir
+    if let Err(e) = std::fs::create_dir_all(outdir) {
+        eprintln!("Error creating output directory: {e}");
+        process::exit(1);
+    }
+
+    match doc {
+        CwlDocument::Workflow(wf) => {
+            // 4a. Build DAG
+            let dag_steps = match dag::build_dag(&wf) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Error building DAG: {e:#}");
+                    process::exit(1);
+                }
+            };
+
+            // Print step names to stderr
+            eprintln!("Workflow steps:");
+            for step in &dag_steps {
+                eprintln!("  - {}", step.name);
+            }
+
+            // Execute workflow
+            let result =
+                match execute::execute_workflow(cwl_file, &wf, &dag_steps, &inputs, outdir) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Error executing workflow: {e:#}");
+                        process::exit(1);
+                    }
+                };
+
+            if !result.success {
+                eprintln!("Workflow execution failed");
+                process::exit(1);
+            }
+
+            // Provenance generation (when provenance module is available)
+            // if !_no_crate {
+            //     if let Err(e) = provenance::generate_crate(&result) {
+            //         eprintln!("Error generating RO-Crate: {e:#}");
+            //     }
+            // }
+
+            eprintln!("Workflow completed successfully");
+            eprintln!("Outputs in: {}", outdir.display());
+        }
+
+        CwlDocument::CommandLineTool(tool) => {
+            let log_dir = outdir.join("logs");
+            let runtime = RuntimeContext {
+                cores: 1,
+                ram: 1024,
+                outdir: outdir.to_string_lossy().to_string(),
+                tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
+            };
+
+            let (exit_code, outputs) =
+                match execute::execute_tool(&tool, &inputs, outdir, &runtime, &log_dir, "tool") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Error executing tool: {e:#}");
+                        process::exit(1);
+                    }
+                };
+
+            // Print outputs to stderr
+            for (name, val) in &outputs {
+                eprintln!("  {name}: {val:?}");
+            }
+
+            if exit_code != 0 {
+                eprintln!("Tool exited with code {exit_code}");
+                process::exit(exit_code);
+            }
+        }
+    }
+}
+
+fn cmd_validate(files: &[PathBuf]) {
+    let mut any_failed = false;
+
+    for file in files {
+        match parse::parse_cwl(file) {
+            Ok(doc) => {
+                let class = match doc {
+                    CwlDocument::CommandLineTool(_) => "CommandLineTool",
+                    CwlDocument::Workflow(_) => "Workflow",
+                };
+                println!("PASS  {}  ({})", file.display(), class);
+            }
+            Err(e) => {
+                println!("FAIL  {}  ({e:#})", file.display());
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        process::exit(1);
+    }
+}
+
+fn cmd_dag(cwl_file: &PathBuf) {
+    let doc = match parse::parse_cwl(cwl_file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error parsing CWL file: {e:#}");
+            process::exit(1);
+        }
+    };
+
+    match doc {
+        CwlDocument::Workflow(wf) => {
+            let dag_steps = match dag::build_dag(&wf) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Error building DAG: {e:#}");
+                    process::exit(1);
+                }
+            };
+            dag::print_dag(&dag_steps);
+        }
+        CwlDocument::CommandLineTool(_) => {
+            eprintln!("Error: {} is a CommandLineTool, not a Workflow", cwl_file.display());
+            eprintln!("The 'dag' subcommand requires a Workflow document");
+            process::exit(1);
+        }
+    }
 }
