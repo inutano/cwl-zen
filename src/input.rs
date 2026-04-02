@@ -194,6 +194,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_file_uri() {
+        let yaml = "input_file:\n  class: File\n  location: \"file:///data/sample.bam\"\n";
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("input.yml");
+        std::fs::write(&input_path, yaml).unwrap();
+        let inputs = parse_inputs(&input_path, dir.path()).unwrap();
+        match inputs.get("input_file") {
+            Some(ResolvedValue::File(f)) => {
+                let path_str = &f.path;
+                assert!(
+                    path_str.contains("/data/sample.bam"),
+                    "path should contain /data/sample.bam, got: {path_str}"
+                );
+                assert!(
+                    !path_str.contains("file://"),
+                    "path should not contain file://, got: {path_str}"
+                );
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_two_step_input() {
         let inputs = parse_inputs(&fixture_path("two-step-input.yml"), &base_dir()).unwrap();
         match inputs.get("message") {
