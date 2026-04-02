@@ -57,7 +57,7 @@ fn yaml_to_resolved(val: &serde_yaml::Value, base_dir: &Path) -> ResolvedValue {
         serde_yaml::Value::Mapping(map) => {
             // Check for class: File or class: Directory
             let class = map
-                .get(&serde_yaml::Value::String("class".to_string()))
+                .get(serde_yaml::Value::String("class".to_string()))
                 .and_then(|v| v.as_str());
 
             match class {
@@ -81,8 +81,8 @@ fn resolve_file_mapping(
     base_dir: &Path,
 ) -> ResolvedValue {
     let raw_path = map
-        .get(&serde_yaml::Value::String("path".to_string()))
-        .or_else(|| map.get(&serde_yaml::Value::String("location".to_string())))
+        .get(serde_yaml::Value::String("path".to_string()))
+        .or_else(|| map.get(serde_yaml::Value::String("location".to_string())))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -90,29 +90,28 @@ fn resolve_file_mapping(
     let mut fv = FileValue::from_path(&resolved_path);
 
     // Process secondaryFiles if present
-    if let Some(sec) = map.get(&serde_yaml::Value::String("secondaryFiles".to_string())) {
-        if let serde_yaml::Value::Sequence(seq) = sec {
-            for entry in seq {
-                if let serde_yaml::Value::Mapping(sf_map) = entry {
-                    let sf_class = sf_map
-                        .get(&serde_yaml::Value::String("class".to_string()))
-                        .and_then(|v| v.as_str());
-                    if sf_class == Some("File") || sf_class == Some("Directory") {
-                        let sf_raw = sf_map
-                            .get(&serde_yaml::Value::String("path".to_string()))
-                            .or_else(|| {
-                                sf_map.get(&serde_yaml::Value::String("location".to_string()))
-                            })
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let sf_resolved = resolve_file_path(sf_raw, base_dir);
-                        fv.secondary_files.push(FileValue::from_path(&sf_resolved));
-                    }
+    if let Some(serde_yaml::Value::Sequence(seq)) =
+        map.get(serde_yaml::Value::String("secondaryFiles".to_string()))
+    {
+        for entry in seq {
+            if let serde_yaml::Value::Mapping(sf_map) = entry {
+                let sf_class = sf_map
+                    .get(serde_yaml::Value::String("class".to_string()))
+                    .and_then(|v| v.as_str());
+                if sf_class == Some("File") || sf_class == Some("Directory") {
+                    let sf_raw = sf_map
+                        .get(serde_yaml::Value::String("path".to_string()))
+                        .or_else(|| {
+                            sf_map.get(serde_yaml::Value::String("location".to_string()))
+                        })
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let sf_resolved = resolve_file_path(sf_raw, base_dir);
+                    fv.secondary_files.push(FileValue::from_path(&sf_resolved));
                 }
             }
         }
     }
-
     ResolvedValue::File(fv)
 }
 
@@ -122,8 +121,8 @@ fn resolve_directory_mapping(
     base_dir: &Path,
 ) -> ResolvedValue {
     let raw_path = map
-        .get(&serde_yaml::Value::String("path".to_string()))
-        .or_else(|| map.get(&serde_yaml::Value::String("location".to_string())))
+        .get(serde_yaml::Value::String("path".to_string()))
+        .or_else(|| map.get(serde_yaml::Value::String("location".to_string())))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 

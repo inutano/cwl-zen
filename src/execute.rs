@@ -360,7 +360,7 @@ fn resolve_step_inputs(
                         entry
                             .default
                             .as_ref()
-                            .map(|d| yaml_to_resolved(d))
+                            .map(yaml_to_resolved)
                             .unwrap_or(ResolvedValue::Null)
                     } else {
                         v
@@ -369,7 +369,7 @@ fn resolve_step_inputs(
                     entry
                         .default
                         .as_ref()
-                        .map(|d| yaml_to_resolved(d))
+                        .map(yaml_to_resolved)
                         .unwrap_or(ResolvedValue::Null)
                 };
 
@@ -406,27 +406,27 @@ fn yaml_to_resolved(val: &serde_yaml::Value) -> ResolvedValue {
         }
         serde_yaml::Value::String(s) => ResolvedValue::String(s.clone()),
         serde_yaml::Value::Sequence(seq) => {
-            let items = seq.iter().map(|v| yaml_to_resolved(v)).collect();
+            let items = seq.iter().map(yaml_to_resolved).collect();
             ResolvedValue::Array(items)
         }
         serde_yaml::Value::Mapping(map) => {
             // Check for class: File or class: Directory
             let class = map
-                .get(&serde_yaml::Value::String("class".to_string()))
+                .get(serde_yaml::Value::String("class".to_string()))
                 .and_then(|v| v.as_str());
             match class {
                 Some("File") => {
                     let path = map
-                        .get(&serde_yaml::Value::String("path".to_string()))
-                        .or_else(|| map.get(&serde_yaml::Value::String("location".to_string())))
+                        .get(serde_yaml::Value::String("path".to_string()))
+                        .or_else(|| map.get(serde_yaml::Value::String("location".to_string())))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     ResolvedValue::File(FileValue::from_path(path))
                 }
                 Some("Directory") => {
                     let path = map
-                        .get(&serde_yaml::Value::String("path".to_string()))
-                        .or_else(|| map.get(&serde_yaml::Value::String("location".to_string())))
+                        .get(serde_yaml::Value::String("path".to_string()))
+                        .or_else(|| map.get(serde_yaml::Value::String("location".to_string())))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     ResolvedValue::Directory(FileValue::from_path(path))

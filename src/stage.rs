@@ -68,7 +68,7 @@ pub fn collect_outputs(
                     let sf_path = resolve_secondary_file_path(&path, &sf_pattern);
                     if sf_path.exists() {
                         let sf_val =
-                            FileValue::from_path(&sf_path.to_string_lossy().to_string());
+                            FileValue::from_path(sf_path.to_string_lossy().as_ref());
                         fv.secondary_files.push(sf_val);
                     }
                 }
@@ -198,7 +198,7 @@ fn collect_stdout_output(tool: &CommandLineTool, workdir: &Path) -> Result<Resol
         Some(filename) => {
             let stdout_path = workdir.join(filename);
             if stdout_path.exists() {
-                let fv = FileValue::from_path(&stdout_path.to_string_lossy().to_string());
+                let fv = FileValue::from_path(stdout_path.to_string_lossy().as_ref());
                 Ok(ResolvedValue::File(fv))
             } else {
                 Ok(ResolvedValue::Null)

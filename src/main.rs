@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -66,7 +66,7 @@ fn main() {
     }
 }
 
-fn cmd_run(cwl_file: &PathBuf, input_file: &PathBuf, outdir: &PathBuf, no_crate: bool) {
+fn cmd_run(cwl_file: &Path, input_file: &Path, outdir: &Path, no_crate: bool) {
     // 1. Parse CWL file
     let doc = match parse::parse_cwl(cwl_file) {
         Ok(d) => d,
@@ -194,7 +194,7 @@ fn cmd_validate(files: &[PathBuf]) {
     }
 }
 
-fn cmd_dag(cwl_file: &PathBuf) {
+fn cmd_dag(cwl_file: &Path) {
     let doc = match parse::parse_cwl(cwl_file) {
         Ok(d) => d,
         Err(e) => {

@@ -22,7 +22,7 @@ pub fn build_dag(workflow: &Workflow) -> Result<Vec<DagStep>> {
     let mut dag_steps: HashMap<&str, DagStep> = HashMap::new();
     for (name, step) in &workflow.steps {
         let mut depends_on = Vec::new();
-        for (_input_name, input_val) in &step.inputs {
+        for input_val in step.inputs.values() {
             let source = match input_val {
                 StepInput::Source(s) => Some(s.as_str()),
                 StepInput::Structured(entry) => entry.source.as_deref(),

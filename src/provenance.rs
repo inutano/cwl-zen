@@ -667,7 +667,7 @@ fn resolved_value_entity_simple(id: &str, val: &ResolvedValue) -> Value {
 // Internal: tataki enrichment
 // ---------------------------------------------------------------------------
 
-fn try_tataki_enrichment(graph: &mut Vec<Value>, _outdir: &Path) {
+fn try_tataki_enrichment(graph: &mut [Value], _outdir: &Path) {
     // Collect file paths from the graph that are actual filesystem paths
     let file_paths: Vec<String> = graph
         .iter()

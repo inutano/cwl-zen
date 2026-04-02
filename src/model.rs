@@ -58,17 +58,14 @@ pub struct CommandLineTool {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[derive(Default)]
 pub enum BaseCommand {
     Single(String),
     Array(Vec<String>),
+    #[default]
     None,
 }
 
-impl Default for BaseCommand {
-    fn default() -> Self {
-        BaseCommand::None
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Argument — plain string or structured entry
@@ -172,17 +169,14 @@ pub struct OutputBinding {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[derive(Default)]
 pub enum GlobPattern {
     Single(String),
     Array(Vec<String>),
+    #[default]
     None,
 }
 
-impl Default for GlobPattern {
-    fn default() -> Self {
-        GlobPattern::None
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CwlType — single string or array of strings (for union types)

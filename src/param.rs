@@ -57,7 +57,7 @@ pub fn value_to_string(val: &ResolvedValue) -> String {
         ResolvedValue::Bool(b) => b.to_string(),
         ResolvedValue::File(fv) => fv.path.clone(),
         ResolvedValue::Directory(fv) => fv.path.clone(),
-        ResolvedValue::Array(arr) => arr.iter().map(|v| value_to_string(v)).collect::<Vec<_>>().join(" "),
+        ResolvedValue::Array(arr) => arr.iter().map(value_to_string).collect::<Vec<_>>().join(" "),
         ResolvedValue::Null => "null".to_string(),
     }
 }
