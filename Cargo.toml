@@ -1,0 +1,20 @@
+[package]
+name = "cwl-zen"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal, JS-free CWL v1.2 runner with built-in provenance"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+glob = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
