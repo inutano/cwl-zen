@@ -228,18 +228,23 @@ If you don't need these, a Makefile is enough.
 
 ## Runner
 
-The CWL Zen runner is a planned Rust implementation:
+The CWL Zen runner is implemented in Rust:
 
 ```bash
 cwl-zen run workflow.cwl input.yml --outdir ./results
 cwl-zen validate workflow.cwl
-cwl-zen lint workflow.cwl     # check CWL Zen compatibility
-cwl-zen dag workflow.cwl      # print step dependency graph
+cwl-zen dag workflow.cwl
 ```
 
-Single static binary. Singularity-native. No JS engine. Fast startup.
+Single static binary. Auto-detects container runtime. No JS engine. Fast startup.
 
-**Status:** Design complete, implementation not yet started.
+**Container support:**
+- Docker, Podman: OCI images, pulled automatically
+- Singularity, Apptainer: SIF images, cached in `~/.cwl-zen/containers/`
+- Auto-detection: uses the first available runtime (podman → apptainer → singularity → docker)
+- Override: `--engine singularity`
+
+**Status:** Core runner implemented. Provenance Run Crate generation built-in.
 
 ## Compatibility
 

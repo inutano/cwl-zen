@@ -33,7 +33,7 @@ CWL Zen is a strict subset of CWL v1.2. This document defines exactly what is su
 | Feature | Why | Alternative |
 |---------|-----|-------------|
 | `InlineJavascriptRequirement` | No JS engine | Parameter references + shell |
-| `InitialWorkDirRequirement` | Complex staging | Shell commands |
+| `InitialWorkDirRequirement` (minimal) | `writable: true` only | Copy-staging for specific inputs |
 | `EnvVarRequirement` | Unnecessary | `export VAR=val` in shell command |
 | `stdin` | Rarely needed | Shell redirect: `< file` |
 | `stderr` | Rarely needed | Shell redirect: `2> file` |
@@ -242,7 +242,7 @@ This pattern replaces `when: $(inputs.optional_file != null)` in workflows — t
 CWL document + input YAML → parse → build DAG → execute steps → collect outputs
 ```
 
-One workflow, one input, one run. Everything else (batch, scheduling, retry) is external.
+One workflow, one input, one run. Batching across samples — whether 10 or 400,000 — is the job of the caller: an AI agent, a SLURM array job, a bash loop. This keeps the runner simple and lets each environment orchestrate in its own way.
 
 ### CLI
 
@@ -252,6 +252,27 @@ cwl-zen validate workflow.cwl
 cwl-zen lint workflow.cwl           # check CWL Zen compatibility
 cwl-zen dag workflow.cwl            # print step dependency graph
 ```
+
+### Container engines
+
+cwl-zen auto-detects the available container runtime in this priority order:
+`podman` → `apptainer` → `singularity` → `docker`
+
+Override with `--engine`:
+
+```bash
+cwl-zen run --engine singularity workflow.cwl input.yml
+```
+
+SIF images for Singularity/Apptainer are cached in `~/.cwl-zen/containers/`.
+Override with `--container-cache` or `$CWL_ZEN_CONTAINER_CACHE`.
+
+### Input staging
+
+Input files are staged into the step working directory as symlinks by default. If a tool fails due to symlink issues, cwl-zen automatically retries with copied files.
+
+Force copy staging: `--copy-inputs`
+Disable auto-retry: `--no-retry-copy`
 
 ### Implementation
 
