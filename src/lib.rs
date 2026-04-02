@@ -1,3 +1,4 @@
+pub mod command;
 pub mod dag;
 pub mod input;
 pub mod model;
