@@ -15,6 +15,7 @@ pub struct ResolvedCommand {
     pub cores: u32,
     pub ram: u64,
     pub stdout_file: Option<String>,
+    pub network_access: bool,
 }
 
 /// Build a resolved command from a parsed CommandLineTool, resolved inputs, and
@@ -156,6 +157,9 @@ pub fn build_command(
         .as_ref()
         .map(|s| param::resolve_param_refs(s, inputs, &effective_runtime, None));
 
+    // 7. Detect NetworkAccess requirement
+    let network_access = crate::parse::has_network_access(tool);
+
     ResolvedCommand {
         command_line,
         use_shell,
@@ -163,6 +167,7 @@ pub fn build_command(
         cores: effective_runtime.cores,
         ram: effective_runtime.ram,
         stdout_file,
+        network_access,
     }
 }
 
@@ -191,6 +196,10 @@ mod tests {
             outdir: "/tmp/out".to_string(),
             tmpdir: "/tmp/tmp".to_string(),
         }
+    }
+
+    fn basic_runtime() -> RuntimeContext {
+        default_runtime()
     }
 
     #[test]
@@ -326,5 +335,76 @@ outputs: {}
         assert_eq!(cmd.cores, 8);
         assert_eq!(cmd.ram, 16384);
         assert_eq!(cmd.command_line, "bwa /data/ref.fa");
+    }
+
+    #[test]
+    fn separate_false_no_space() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+inputs:
+  threads:
+    type: int
+    inputBinding:
+      prefix: "--threads="
+      separate: false
+      position: 1
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert("threads".into(), ResolvedValue::Int(8));
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        assert!(cmd.command_line.contains("--threads=8"));
+    }
+
+    #[test]
+    fn network_access_detected() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: curl
+requirements:
+  - class: NetworkAccess
+    networkAccess: true
+inputs: {}
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let cmd = build_command(&tool, &HashMap::new(), &basic_runtime());
+        assert!(cmd.network_access);
+    }
+
+    #[test]
+    fn network_access_default_false() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let cmd = build_command(&tool, &HashMap::new(), &basic_runtime());
+        assert!(!cmd.network_access);
     }
 }

@@ -88,6 +88,13 @@ pub fn resource_requirement(tool: &CommandLineTool) -> (u32, u64) {
     (cores, ram)
 }
 
+/// Check whether a CommandLineTool has NetworkAccess requirement.
+pub fn has_network_access(tool: &CommandLineTool) -> bool {
+    tool.requirements.iter().any(|req| {
+        req.get("class").and_then(|v| v.as_str()) == Some("NetworkAccess")
+    })
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
