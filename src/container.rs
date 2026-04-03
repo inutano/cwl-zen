@@ -88,8 +88,11 @@ impl ContainerEngine for OciEngine {
     }
 
     fn pull(&self, image: &str, _cache_dir: &Path) -> Result<()> {
+        // Suppress stdout to avoid corrupting JSON output
         let status = Command::new(&self.binary)
-            .args(["pull", image])
+            .args(["pull", "--quiet", image])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .with_context(|| format!("{}: failed to pull image {}", self.binary, image))?;
         if !status.success() {

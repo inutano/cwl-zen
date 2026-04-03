@@ -32,4 +32,4 @@ if [ -z "$JOB_FILE" ]; then
     echo "{}" > "$JOB_FILE"
 fi
 
-exec "$(dirname "$0")/target/debug/cwl-zen" run "$CWL_FILE" "$JOB_FILE" --outdir "$OUTDIR" --no-crate 2>/dev/null
+exec "$(dirname "$0")/target/debug/cwl-zen" run "$CWL_FILE" "$JOB_FILE" --outdir "$OUTDIR" --no-crate --copy-inputs 2>/dev/null
