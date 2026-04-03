@@ -51,6 +51,7 @@ fn run_echo_tool() {
         &engine,
         StagingMode::Symlink,
         false,
+        None,
     )
     .expect("execute_tool failed");
 

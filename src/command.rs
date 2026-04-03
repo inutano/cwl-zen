@@ -15,6 +15,8 @@ pub struct ResolvedCommand {
     pub cores: u32,
     pub ram: u64,
     pub stdout_file: Option<String>,
+    pub stdin_file: Option<String>,
+    pub stderr_file: Option<String>,
     pub network_access: bool,
 }
 
@@ -126,7 +128,53 @@ pub fn build_command(
 
         let position = binding.position.unwrap_or(0);
 
-        // Resolve the value: use valueFrom if present, otherwise stringify the value
+        // Resolve the value: use valueFrom if present, otherwise stringify the value.
+        // Handle array values with itemSeparator: join elements with separator into
+        // a single string. Without itemSeparator, each array element becomes a
+        // separate arg (possibly each prefixed).
+        if let ResolvedValue::Array(arr) = val {
+            if binding.value_from.is_none() {
+                if let Some(ref sep) = binding.item_separator {
+                    // Join array elements with separator into single value
+                    let value_str = arr
+                        .iter()
+                        .map(|v| param::value_to_string(v))
+                        .collect::<Vec<_>>()
+                        .join(sep);
+
+                    let separate = binding.separate.unwrap_or(true);
+                    let tokens = if let Some(ref prefix) = binding.prefix {
+                        if separate {
+                            vec![prefix.clone(), value_str]
+                        } else {
+                            vec![format!("{}{}", prefix, value_str)]
+                        }
+                    } else {
+                        vec![value_str]
+                    };
+                    parts.push((position, tokens));
+                    continue;
+                } else {
+                    // No itemSeparator: each array element is a separate arg
+                    for item in arr {
+                        let item_str = param::value_to_string(item);
+                        let separate = binding.separate.unwrap_or(true);
+                        let tokens = if let Some(ref prefix) = binding.prefix {
+                            if separate {
+                                vec![prefix.clone(), item_str]
+                            } else {
+                                vec![format!("{}{}", prefix, item_str)]
+                            }
+                        } else {
+                            vec![item_str]
+                        };
+                        parts.push((position, tokens));
+                    }
+                    continue;
+                }
+            }
+        }
+
         let value_str = if let Some(ref vf) = binding.value_from {
             param::resolve_param_refs(vf, inputs, &effective_runtime, Some(val))
         } else {
@@ -163,7 +211,19 @@ pub fn build_command(
         .as_ref()
         .map(|s| param::resolve_param_refs(s, inputs, &effective_runtime, None));
 
-    // 7. Detect NetworkAccess requirement
+    // 7. Resolve stdin
+    let stdin_file = tool
+        .stdin
+        .as_ref()
+        .map(|s| param::resolve_param_refs(s, inputs, &effective_runtime, None));
+
+    // 8. Resolve stderr
+    let stderr_file = tool
+        .stderr
+        .as_ref()
+        .map(|s| param::resolve_param_refs(s, inputs, &effective_runtime, None));
+
+    // 9. Detect NetworkAccess requirement
     let network_access = crate::parse::has_network_access(tool);
 
     ResolvedCommand {
@@ -173,6 +233,8 @@ pub fn build_command(
         cores: effective_runtime.cores,
         ram: effective_runtime.ram,
         stdout_file,
+        stdin_file,
+        stderr_file,
         network_access,
     }
 }
@@ -504,5 +566,136 @@ outputs: {}
 
         // With separate=false, prefix and value should be a single token
         assert_eq!(cmd.args, vec!["tool", "--threads=8"]);
+    }
+
+    #[test]
+    fn item_separator_joins_array() {
+        // Array input with itemSeparator should produce a single joined value
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+inputs:
+  values:
+    type:
+      type: array
+      items: int
+    inputBinding:
+      prefix: "-I"
+      position: 1
+      itemSeparator: ","
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "values".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::Int(1),
+                ResolvedValue::Int(2),
+                ResolvedValue::Int(3),
+                ResolvedValue::Int(4),
+            ]),
+        );
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        assert_eq!(cmd.args, vec!["tool", "-I", "1,2,3,4"]);
+    }
+
+    #[test]
+    fn array_without_item_separator_separate_args() {
+        // Array input without itemSeparator: each element is a separate arg
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+inputs:
+  files:
+    type:
+      type: array
+      items: string
+    inputBinding:
+      position: 1
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "files".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::String("a.txt".to_string()),
+                ResolvedValue::String("b.txt".to_string()),
+            ]),
+        );
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        assert_eq!(cmd.args, vec!["tool", "a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn stdin_resolved_from_tool() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: cat
+inputs:
+  file1:
+    type: File
+outputs: {}
+stdin: $(inputs.file1.path)
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::File(FileValue {
+                path: "/data/input.txt".to_string(),
+                basename: "input.txt".to_string(),
+                nameroot: "input".to_string(),
+                nameext: ".txt".to_string(),
+                size: 100,
+                checksum: None,
+                secondary_files: Vec::new(),
+            }),
+        );
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        assert_eq!(cmd.stdin_file, Some("/data/input.txt".to_string()));
+    }
+
+    #[test]
+    fn stderr_resolved_from_tool() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: echo
+inputs: {}
+outputs: {}
+stderr: error.log
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let cmd = build_command(&tool, &HashMap::new(), &basic_runtime());
+        assert_eq!(cmd.stderr_file, Some("error.log".to_string()));
     }
 }

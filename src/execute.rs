@@ -75,6 +75,7 @@ pub fn execute_tool(
     engine: &dyn ContainerEngine,
     staging_mode: StagingMode,
     no_retry_copy: bool,
+    tool_dir: Option<&Path>,
 ) -> Result<(i32, HashMap<String, ResolvedValue>)> {
     // 1. Create workdir and log_dir
     fs::create_dir_all(workdir)
@@ -82,8 +83,29 @@ pub fn execute_tool(
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log_dir: {}", log_dir.display()))?;
 
+    // 1b. Merge tool-level defaults for missing inputs
+    let mut inputs = inputs.clone();
+    for (name, input_def) in &tool.inputs {
+        if !inputs.contains_key(name) {
+            if let Some(default) = &input_def.default {
+                let mut resolved = yaml_to_resolved(default);
+                // If it's a File default with a relative path, resolve against tool's directory
+                if let ResolvedValue::File(ref mut fv) = resolved {
+                    if let Some(tdir) = tool_dir {
+                        if !Path::new(&fv.path).is_absolute() {
+                            let abs_path = tdir.join(&fv.path);
+                            let abs_str = abs_path.to_string_lossy().to_string();
+                            *fv = FileValue::from_path(&abs_str);
+                        }
+                    }
+                }
+                inputs.insert(name.clone(), resolved);
+            }
+        }
+    }
+
     // 2. Stage inputs into workdir
-    let staged_inputs = staging::stage_inputs(inputs, workdir, staging_mode)?;
+    let staged_inputs = staging::stage_inputs(&inputs, workdir, staging_mode)?;
 
     // 2b. Materialize InitialWorkDirRequirement listing entries
     for (name, content) in parse::initial_workdir_listing(tool) {
@@ -159,6 +181,13 @@ pub fn execute_tool(
         cmd.stdout(stdout_file).stderr(stderr_file);
         cmd.current_dir(workdir);
 
+        // Redirect stdin from file if specified
+        if let Some(ref stdin_path) = resolved_cmd.stdin_file {
+            let stdin_f = fs::File::open(stdin_path)
+                .with_context(|| format!("opening stdin file: {}", stdin_path))?;
+            cmd.stdin(stdin_f);
+        }
+
         let status = cmd
             .status()
             .with_context(|| format!("running command for step '{}'", step_name))?;
@@ -184,7 +213,7 @@ pub fn execute_tool(
             // Re-run with Copy mode and no_retry_copy=true to avoid infinite recursion
             let (retry_exit_code, retry_outputs) = execute_tool(
                 tool,
-                inputs,
+                &inputs,
                 &retry_workdir,
                 runtime,
                 log_dir,
@@ -192,6 +221,7 @@ pub fn execute_tool(
                 engine,
                 StagingMode::Copy,
                 true,
+                tool_dir,
             )?;
 
             if retry_exit_code == 0 {
@@ -212,6 +242,48 @@ pub fn execute_tool(
                 stdout_log.display()
             )
         })?;
+    }
+
+    // 8b. If stderr redirect: copy stderr log to workdir/{stderr_file}
+    // Also handle auto-generated stderr filename when an output has type: stderr
+    // but no explicit stderr field on the tool.
+    let stderr_filename = if resolved_cmd.stderr_file.is_some() {
+        resolved_cmd.stderr_file.clone()
+    } else {
+        // Check if any output has type: stderr
+        let has_stderr_output = tool.outputs.values().any(|o| o.cwl_type.base_type() == "stderr");
+        if has_stderr_output {
+            Some(format!("{}.stderr", uuid::Uuid::new_v4()))
+        } else {
+            None
+        }
+    };
+    if let Some(ref stderr_fname) = stderr_filename {
+        let dest = workdir.join(stderr_fname);
+        fs::copy(&stderr_log, &dest).with_context(|| {
+            format!(
+                "copying stderr log to {}: {}",
+                dest.display(),
+                stderr_log.display()
+            )
+        })?;
+    }
+
+    // 8c. Similarly, handle auto-generated stdout filename for type: stdout
+    // when no explicit stdout field on the tool.
+    if resolved_cmd.stdout_file.is_none() {
+        let has_stdout_output = tool.outputs.values().any(|o| o.cwl_type.base_type() == "stdout");
+        if has_stdout_output {
+            let auto_name = format!("{}.stdout", uuid::Uuid::new_v4());
+            let dest = workdir.join(&auto_name);
+            fs::copy(&stdout_log, &dest).with_context(|| {
+                format!(
+                    "copying stdout log to {}: {}",
+                    dest.display(),
+                    stdout_log.display()
+                )
+            })?;
+        }
     }
 
     // 9. Check for cwl.output.json (CWL spec: tool can write outputs as JSON)
@@ -328,6 +400,10 @@ pub fn execute_workflow(
             engine,
             staging_mode,
             no_retry_copy,
+            tool_path.canonicalize().ok().as_deref()
+                .and_then(|p| p.parent())
+                .or_else(|| tool_path.parent())
+                .or(Some(Path::new("."))),
         )?;
 
         let step_end = Utc::now();
@@ -1011,6 +1087,45 @@ mod tests {
             }
         } else {
             panic!("expected JSON object");
+        }
+    }
+
+    // -- Test: yaml_to_resolved handles File objects ----------------------------
+
+    #[test]
+    fn yaml_to_resolved_file_object() {
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+class: File
+location: args.py
+"#,
+        )
+        .unwrap();
+        let resolved = yaml_to_resolved(&yaml_val);
+        match resolved {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.path, "args.py");
+                assert_eq!(fv.basename, "args.py");
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn yaml_to_resolved_directory_object() {
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+class: Directory
+path: /data/outdir
+"#,
+        )
+        .unwrap();
+        let resolved = yaml_to_resolved(&yaml_val);
+        match resolved {
+            ResolvedValue::Directory(fv) => {
+                assert_eq!(fv.path, "/data/outdir");
+            }
+            other => panic!("expected Directory, got {:?}", other),
         }
     }
 }

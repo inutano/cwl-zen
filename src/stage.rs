@@ -40,6 +40,13 @@ pub fn collect_outputs(
             continue;
         }
 
+        // Handle stderr output type
+        if base_type == "stderr" {
+            let val = collect_stderr_output(tool, workdir)?;
+            result.insert(name.clone(), val);
+            continue;
+        }
+
         // Resolve glob patterns
         let patterns = match &output.output_binding {
             Some(binding) => resolve_glob_patterns(&binding.glob, inputs, runtime),
@@ -164,8 +171,50 @@ fn collect_stdout_output(tool: &CommandLineTool, workdir: &Path) -> Result<Resol
                 Ok(ResolvedValue::Null)
             }
         }
-        None => Ok(ResolvedValue::Null),
+        None => {
+            // CWL spec: if stdout field is absent but type: stdout is used,
+            // look for auto-generated *.stdout file in workdir
+            find_auto_generated_file(workdir, ".stdout")
+        }
     }
+}
+
+/// Handle `type: stderr` outputs by looking for `tool.stderr` in `workdir`.
+fn collect_stderr_output(tool: &CommandLineTool, workdir: &Path) -> Result<ResolvedValue> {
+    match &tool.stderr {
+        Some(filename) => {
+            let stderr_path = workdir.join(filename);
+            if stderr_path.exists() {
+                let fv = FileValue::from_path(stderr_path.to_string_lossy().as_ref());
+                Ok(ResolvedValue::File(fv))
+            } else {
+                Ok(ResolvedValue::Null)
+            }
+        }
+        None => {
+            // CWL spec: if stderr field is absent but type: stderr is used,
+            // look for auto-generated *.stderr file in workdir
+            find_auto_generated_file(workdir, ".stderr")
+        }
+    }
+}
+
+/// Find an auto-generated file with the given suffix (e.g. ".stderr", ".stdout")
+/// in workdir. These files are created by execute.rs with UUID-based names.
+fn find_auto_generated_file(workdir: &Path, suffix: &str) -> Result<ResolvedValue> {
+    let pattern = workdir.join(format!("*{}", suffix));
+    let pattern_str = pattern.to_string_lossy().to_string();
+    if let Ok(entries) = glob::glob(&pattern_str) {
+        for entry in entries {
+            if let Ok(path) = entry {
+                if path.is_file() {
+                    let fv = FileValue::from_path(path.to_string_lossy().as_ref());
+                    return Ok(ResolvedValue::File(fv));
+                }
+            }
+        }
+    }
+    Ok(ResolvedValue::Null)
 }
 
 /// Strip the last extension from a path. If no extension, return unchanged.
@@ -304,6 +353,7 @@ mod tests {
             hints: Vec::new(),
             stdout: None,
             stdin: None,
+            stderr: None,
         };
 
         let inputs = HashMap::new();
@@ -314,6 +364,108 @@ mod tests {
             ResolvedValue::File(fv) => {
                 assert_eq!(fv.basename, "result.txt");
                 assert!(fv.path.ends_with("result.txt"));
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn collect_outputs_stderr_with_explicit_filename() {
+        use crate::model::{CommandLineTool, CwlType, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        // Create stderr file
+        fs::write(workdir.join("std.err"), "error output").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "output_file".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("stderr".to_string()),
+                output_binding: None,
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("echo".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: Some("std.err".to_string()),
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("output_file").unwrap() {
+            ResolvedValue::File(fv) => {
+                assert!(fv.path.ends_with("std.err"));
+                assert_eq!(fv.basename, "std.err");
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn collect_outputs_stderr_auto_generated() {
+        use crate::model::{CommandLineTool, CwlType, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        // Create an auto-generated stderr file (like execute.rs would)
+        let auto_name = format!("{}.stderr", uuid::Uuid::new_v4());
+        fs::write(workdir.join(&auto_name), "error output").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "output_file".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("stderr".to_string()),
+                output_binding: None,
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("echo".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None, // No explicit stderr field
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("output_file").unwrap() {
+            ResolvedValue::File(fv) => {
+                assert!(fv.basename.ends_with(".stderr"));
             }
             other => panic!("expected File, got {:?}", other),
         }

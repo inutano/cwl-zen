@@ -239,6 +239,11 @@ fn cmd_run(
                 tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
             };
 
+            let tool_dir = cwl_file
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .or_else(|| cwl_file.parent().map(|p| p.to_path_buf()));
             let (exit_code, outputs) = match execute::execute_tool(
                 &tool,
                 &inputs,
@@ -249,6 +254,7 @@ fn cmd_run(
                 engine.as_ref(),
                 staging_mode,
                 no_retry_copy,
+                tool_dir.as_deref(),
             ) {
                 Ok(r) => r,
                 Err(e) => {

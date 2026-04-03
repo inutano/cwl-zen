@@ -213,6 +213,9 @@ pub struct CommandLineTool {
 
     #[serde(default)]
     pub stdin: Option<String>,
+
+    #[serde(default)]
+    pub stderr: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
