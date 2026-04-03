@@ -82,6 +82,9 @@ pub fn value_to_json(val: &ResolvedValue) -> serde_json::Value {
             if let Some(ref cs) = fv.checksum {
                 obj["checksum"] = serde_json::json!(cs);
             }
+            if let Some(ref contents) = fv.contents {
+                obj["contents"] = serde_json::json!(contents);
+            }
             if !fv.secondary_files.is_empty() {
                 obj["secondaryFiles"] = serde_json::Value::Array(
                     fv.secondary_files.iter().map(|sf| value_to_json(&ResolvedValue::File(sf.clone()))).collect()
@@ -200,6 +203,7 @@ fn resolve_file_property(fv: &FileValue, property: &str) -> String {
         "nameroot" => fv.nameroot.clone(),
         "nameext" => fv.nameext.clone(),
         "size" => fv.size.to_string(),
+        "contents" => fv.contents.clone().unwrap_or_else(|| "null".to_string()),
         _ => "null".to_string(),
     }
 }
@@ -250,6 +254,7 @@ mod tests {
                 size: 1024,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
         inputs
@@ -352,6 +357,7 @@ mod tests {
             size: 512,
             checksum: None,
             secondary_files: Vec::new(),
+            contents: None,
         });
         let result = resolve_param_refs("$(self.path)", &inputs, &runtime, Some(&self_val));
         assert_eq!(result, "/data/input.bam");
@@ -424,6 +430,7 @@ mod tests {
             size: 0,
             checksum: None,
             secondary_files: Vec::new(),
+            contents: None,
         };
         assert_eq!(
             value_to_string(&ResolvedValue::File(fv.clone())),

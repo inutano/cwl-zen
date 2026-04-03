@@ -272,6 +272,26 @@ fn cmd_run(
                 process::exit(exit_code);
             }
         }
+
+        CwlDocument::ExpressionTool(expr_tool) => {
+            let runtime = RuntimeContext {
+                cores: 1,
+                ram: 1024,
+                outdir: outdir.to_string_lossy().to_string(),
+                tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
+            };
+
+            let outputs = match execute::execute_expression_tool(&expr_tool, &inputs, &runtime) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("Error executing ExpressionTool: {e:#}");
+                    process::exit(1);
+                }
+            };
+
+            let json_out = cwl_zen::param::outputs_to_json(&outputs);
+            println!("{}", serde_json::to_string_pretty(&json_out).unwrap_or_default());
+        }
     }
 }
 
@@ -283,6 +303,7 @@ fn cmd_validate(files: &[PathBuf]) {
             Ok(doc) => {
                 let class = match doc {
                     CwlDocument::CommandLineTool(_) => "CommandLineTool",
+                    CwlDocument::ExpressionTool(_) => "ExpressionTool",
                     CwlDocument::Workflow(_) => "Workflow",
                 };
                 println!("PASS  {}  ({})", file.display(), class);
@@ -319,8 +340,8 @@ fn cmd_dag(cwl_file: &Path) {
             };
             dag::print_dag(&dag_steps);
         }
-        CwlDocument::CommandLineTool(_) => {
-            eprintln!("Error: {} is a CommandLineTool, not a Workflow", cwl_file.display());
+        CwlDocument::CommandLineTool(_) | CwlDocument::ExpressionTool(_) => {
+            eprintln!("Error: {} is not a Workflow", cwl_file.display());
             eprintln!("The 'dag' subcommand requires a Workflow document");
             process::exit(1);
         }

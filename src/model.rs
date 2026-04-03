@@ -166,12 +166,42 @@ where
 // Top-level CWL document
 // ---------------------------------------------------------------------------
 
-/// A CWL document is either a CommandLineTool or a Workflow.
+/// A CWL document is either a CommandLineTool, ExpressionTool, or a Workflow.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "class")]
 pub enum CwlDocument {
     CommandLineTool(CommandLineTool),
+    ExpressionTool(ExpressionTool),
     Workflow(Workflow),
+}
+
+// ---------------------------------------------------------------------------
+// ExpressionTool
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpressionTool {
+    #[serde(default)]
+    pub cwl_version: Option<String>,
+
+    #[serde(default)]
+    pub label: Option<String>,
+
+    #[serde(default)]
+    pub doc: Option<String>,
+
+    #[serde(default, deserialize_with = "deserialize_requirements")]
+    pub requirements: Vec<serde_yaml::Value>,
+
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
+    pub inputs: HashMap<String, ToolInput>,
+
+    #[serde(default, deserialize_with = "deserialize_map_or_list")]
+    pub outputs: HashMap<String, ToolOutput>,
+
+    #[serde(default)]
+    pub expression: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +399,12 @@ impl HasId for ToolOutput {
 pub struct OutputBinding {
     #[serde(default)]
     pub glob: GlobPattern,
+
+    #[serde(default)]
+    pub load_contents: Option<bool>,
+
+    #[serde(default)]
+    pub output_eval: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -812,6 +848,9 @@ pub struct FileValue {
     pub size: u64,
     pub checksum: Option<String>,
     pub secondary_files: Vec<FileValue>,
+    /// File contents loaded when `loadContents: true` (limited to 64 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<String>,
 }
 
 impl FileValue {
@@ -862,6 +901,7 @@ impl FileValue {
             size,
             checksum,
             secondary_files: Vec::new(),
+            contents: None,
         }
     }
 }
@@ -996,6 +1036,57 @@ stdout: output.txt
                 assert_eq!(tool.stdout, Some("output.txt".to_string()));
             }
             _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Serde round-trip for ExpressionTool ----------------------------------
+
+    #[test]
+    fn deserialize_expression_tool() {
+        let yaml = r#"
+class: ExpressionTool
+cwlVersion: v1.2
+requirements:
+  - class: InlineJavascriptRequirement
+inputs:
+  file1:
+    type: File
+    inputBinding:
+      loadContents: true
+outputs:
+  output:
+    type: int
+expression: "${return {\"output\": parseInt(inputs.file1.contents)};}"
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::ExpressionTool(et) => {
+                assert_eq!(et.cwl_version, Some("v1.2".to_string()));
+                assert!(et.inputs.contains_key("file1"));
+                assert!(et.outputs.contains_key("output"));
+                assert!(et.expression.is_some());
+                assert!(et.expression.as_ref().unwrap().contains("parseInt"));
+                assert_eq!(et.requirements.len(), 1);
+            }
+            _ => panic!("Expected ExpressionTool"),
+        }
+    }
+
+    #[test]
+    fn deserialize_expression_tool_minimal() {
+        let yaml = r#"
+class: ExpressionTool
+inputs: {}
+outputs: {}
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::ExpressionTool(et) => {
+                assert!(et.inputs.is_empty());
+                assert!(et.outputs.is_empty());
+                assert!(et.expression.is_none());
+            }
+            _ => panic!("Expected ExpressionTool"),
         }
     }
 

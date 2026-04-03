@@ -10,7 +10,7 @@ use crate::command;
 use crate::container::{self, ContainerEngine, ContainerExecRequest};
 use crate::dag::DagStep;
 use crate::model::{
-    CwlDocument, FileValue, ResolvedValue, RuntimeContext, StepInput, Workflow,
+    CwlDocument, ExpressionTool, FileValue, ResolvedValue, RuntimeContext, StepInput, Workflow,
 };
 use crate::param;
 use crate::parse;
@@ -181,11 +181,13 @@ pub fn execute_tool(
         cmd.stdout(stdout_file).stderr(stderr_file);
         cmd.current_dir(workdir);
 
-        // Redirect stdin from file if specified
+        // Redirect stdin from file if specified (skip if resolved to "null" or empty)
         if let Some(ref stdin_path) = resolved_cmd.stdin_file {
-            let stdin_f = fs::File::open(stdin_path)
-                .with_context(|| format!("opening stdin file: {}", stdin_path))?;
-            cmd.stdin(stdin_f);
+            if stdin_path != "null" && !stdin_path.is_empty() {
+                let stdin_f = fs::File::open(stdin_path)
+                    .with_context(|| format!("opening stdin file: {}", stdin_path))?;
+                cmd.stdin(stdin_f);
+            }
         }
 
         let status = cmd
@@ -358,12 +360,7 @@ pub fn execute_workflow(
         let tool_path = wf_dir.join(&dag_step.tool_path);
         let doc = parse::parse_cwl(&tool_path)
             .with_context(|| format!("parsing tool for step '{}': {}", step_name, tool_path.display()))?;
-        let tool = match doc {
-            CwlDocument::CommandLineTool(t) => t,
-            _ => bail!("step '{}' must reference a CommandLineTool, not a Workflow", step_name),
-        };
-
-        // b. Resolve step inputs
+        // b. Resolve step inputs (needed by both CommandLineTool and ExpressionTool)
         let wf_step = workflow
             .steps
             .get(step_name)
@@ -379,6 +376,38 @@ pub fn execute_workflow(
                 tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
             },
         )?;
+
+        // Handle ExpressionTool steps directly (no shell execution needed)
+        if let CwlDocument::ExpressionTool(ref expr_tool) = doc {
+            let expr_runtime = RuntimeContext {
+                cores: 1,
+                ram: 1024,
+                outdir: outdir.to_string_lossy().to_string(),
+                tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
+            };
+            let expr_outputs = execute_expression_tool(expr_tool, &step_inputs, &expr_runtime)?;
+
+            let step_end = Utc::now();
+            step_results.push(StepResult {
+                step_name: step_name.clone(),
+                tool_path: tool_path.clone(),
+                container_image: None,
+                start_time: step_start,
+                end_time: step_end,
+                exit_code: 0,
+                inputs: step_inputs,
+                outputs: expr_outputs.clone(),
+                stdout_path: None,
+                stderr_path: None,
+            });
+            step_outputs.insert(step_name.clone(), expr_outputs);
+            continue;
+        }
+
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => bail!("step '{}' must reference a CommandLineTool, not a Workflow", step_name),
+        };
 
         // c. Create per-step workdir
         let step_workdir = outdir.join(".steps").join(step_name);
@@ -478,6 +507,261 @@ pub fn execute_workflow(
         end_time,
         success,
     })
+}
+
+/// Execute an ExpressionTool.
+///
+/// ExpressionTools require JavaScript evaluation which CWL Zen does not support.
+/// However, for simple passthrough patterns we try our best:
+///   - `$(inputs.x)` -- direct passthrough of input value
+///   - `${return {"output": inputs.x};}` -- simple return of input values
+///
+/// For anything more complex, returns an error explaining the limitation.
+pub fn execute_expression_tool(
+    expr_tool: &ExpressionTool,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Result<HashMap<String, ResolvedValue>> {
+    let expression = expr_tool
+        .expression
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+
+    if expression.is_empty() {
+        bail!("ExpressionTool has no expression defined");
+    }
+
+    // Try to evaluate simple JS-like expressions.
+    // Pattern 1: ${return {"key": inputs.x, ...};}
+    // Pattern 2: ${return {"key": parseInt(inputs.x.contents)};}
+    if let Some(result) = try_eval_simple_js_return(expression, inputs, runtime) {
+        return Ok(result);
+    }
+
+    bail!(
+        "ExpressionTool requires JavaScript evaluation which is not supported in CWL Zen.\n\
+         Expression: {}",
+        expression
+    )
+}
+
+/// Try to evaluate a simple JS `${return {key: expr, ...};}` pattern.
+///
+/// Supports:
+///   - `inputs.x` -> passthrough
+///   - `inputs.x.contents` -> string property
+///   - `inputs.x.path` -> string property
+///   - `inputs.x.size` -> int property
+///   - `parseInt(inputs.x.contents)` -> parse int from string
+///   - `parseInt(inputs.x)` -> parse int from string/int value
+///   - string/number literals
+fn try_eval_simple_js_return(
+    expression: &str,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<HashMap<String, ResolvedValue>> {
+    // Strip ${ ... }
+    let inner = expression.strip_prefix("${")?.strip_suffix('}')?;
+    let inner = inner.trim();
+
+    // Must start with "return"
+    let body = inner.strip_prefix("return")?.trim();
+
+    // Must be a JSON-like object: { ... };
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+    let body = body.strip_prefix('{')?.strip_suffix('}')?.trim();
+
+    // Parse comma-separated key-value pairs: "key": expr, "key2": expr2
+    let mut result = HashMap::new();
+    let pairs = split_top_level(body, ',');
+
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        // Split on first ':'
+        let colon_pos = pair.find(':')?;
+        let key = pair[..colon_pos].trim();
+        let val_expr = pair[colon_pos + 1..].trim();
+
+        // Strip quotes from key
+        let key = key
+            .strip_prefix('"')
+            .and_then(|k| k.strip_suffix('"'))
+            .or_else(|| key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+            .unwrap_or(key);
+
+        let resolved = eval_simple_expr(val_expr, inputs, runtime)?;
+        result.insert(key.to_string(), resolved);
+    }
+
+    Some(result)
+}
+
+/// Split a string on a delimiter, respecting parentheses and brackets.
+fn split_top_level(s: &str, delim: char) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for ch in s.chars() {
+        if ch == '(' || ch == '[' || ch == '{' {
+            depth += 1;
+            current.push(ch);
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            depth -= 1;
+            current.push(ch);
+        } else if ch == delim && depth == 0 {
+            result.push(current.clone());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// Evaluate a simple expression within a `${return ...}` block.
+fn eval_simple_expr(
+    expr: &str,
+    inputs: &HashMap<String, ResolvedValue>,
+    _runtime: &RuntimeContext,
+) -> Option<ResolvedValue> {
+    let expr = expr.trim();
+
+    // Null literal
+    if expr == "null" {
+        return Some(ResolvedValue::Null);
+    }
+
+    // Boolean literals
+    if expr == "true" {
+        return Some(ResolvedValue::Bool(true));
+    }
+    if expr == "false" {
+        return Some(ResolvedValue::Bool(false));
+    }
+
+    // Numeric literal
+    if let Ok(n) = expr.parse::<i64>() {
+        return Some(ResolvedValue::Int(n));
+    }
+    if let Ok(f) = expr.parse::<f64>() {
+        return Some(ResolvedValue::Float(f));
+    }
+
+    // String literal
+    if (expr.starts_with('"') && expr.ends_with('"'))
+        || (expr.starts_with('\'') && expr.ends_with('\''))
+    {
+        let s = &expr[1..expr.len() - 1];
+        return Some(ResolvedValue::String(s.to_string()));
+    }
+
+    // parseInt(expr)
+    if let Some(inner) = expr
+        .strip_prefix("parseInt(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_simple_expr(inner.trim(), inputs, _runtime)?;
+        let n = parse_int_from_value(&inner_val)?;
+        return Some(ResolvedValue::Int(n));
+    }
+
+    // parseFloat(expr)
+    if let Some(inner) = expr
+        .strip_prefix("parseFloat(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_simple_expr(inner.trim(), inputs, _runtime)?;
+        let f = parse_float_from_value(&inner_val)?;
+        return Some(ResolvedValue::Float(f));
+    }
+
+    // self[0].contents -- for outputEval context (not applicable here but keep pattern)
+
+    // inputs.X or inputs.X.property
+    if let Some(rest) = expr.strip_prefix("inputs.") {
+        return resolve_input_value(rest, inputs);
+    }
+
+    // Array literal [expr, expr, ...]
+    if expr.starts_with('[') && expr.ends_with(']') {
+        let inner = &expr[1..expr.len() - 1];
+        let items = split_top_level(inner, ',');
+        let mut arr = Vec::new();
+        for item in items {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            arr.push(eval_simple_expr(item, inputs, _runtime)?);
+        }
+        return Some(ResolvedValue::Array(arr));
+    }
+
+    None
+}
+
+/// Resolve an `inputs.X` or `inputs.X.property` reference.
+fn resolve_input_value(rest: &str, inputs: &HashMap<String, ResolvedValue>) -> Option<ResolvedValue> {
+    if let Some(dot_pos) = rest.find('.') {
+        let name = &rest[..dot_pos];
+        let property = &rest[dot_pos + 1..];
+        let val = inputs.get(name)?;
+        match val {
+            ResolvedValue::File(fv) | ResolvedValue::Directory(fv) => match property {
+                "path" => Some(ResolvedValue::String(fv.path.clone())),
+                "basename" => Some(ResolvedValue::String(fv.basename.clone())),
+                "nameroot" => Some(ResolvedValue::String(fv.nameroot.clone())),
+                "nameext" => Some(ResolvedValue::String(fv.nameext.clone())),
+                "size" => Some(ResolvedValue::Int(fv.size as i64)),
+                "contents" => Some(ResolvedValue::String(
+                    fv.contents.clone().unwrap_or_default(),
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        inputs.get(rest).cloned()
+    }
+}
+
+/// Parse an integer from a ResolvedValue (used for parseInt emulation).
+fn parse_int_from_value(val: &ResolvedValue) -> Option<i64> {
+    match val {
+        ResolvedValue::Int(n) => Some(*n),
+        ResolvedValue::Float(f) => Some(*f as i64),
+        ResolvedValue::String(s) => {
+            // parseInt in JS stops at the first non-numeric char
+            let s = s.trim();
+            let numeric: String = if s.starts_with('-') {
+                std::iter::once('-')
+                    .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                    .collect()
+            } else {
+                s.chars().take_while(|c| c.is_ascii_digit()).collect()
+            };
+            numeric.parse::<i64>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Parse a float from a ResolvedValue (used for parseFloat emulation).
+fn parse_float_from_value(val: &ResolvedValue) -> Option<f64> {
+    match val {
+        ResolvedValue::Int(n) => Some(*n as f64),
+        ResolvedValue::Float(f) => Some(*f),
+        ResolvedValue::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +987,7 @@ mod tests {
                 size: 4096,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
         step_outputs.insert("align".to_string(), align_outputs);
@@ -1126,6 +1411,144 @@ path: /data/outdir
                 assert_eq!(fv.path, "/data/outdir");
             }
             other => panic!("expected Directory, got {:?}", other),
+        }
+    }
+
+    // -- ExpressionTool execution tests -----------------------------------------
+
+    #[test]
+    fn execute_expression_tool_simple_passthrough() {
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some("${return {\"output\": inputs.message};}".to_string()),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "message".to_string(),
+            ResolvedValue::String("hello world".to_string()),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::String(s)) => assert_eq!(s, "hello world"),
+            other => panic!("expected String(\"hello world\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_parse_int() {
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some("${return {\"output\": parseInt(inputs.file1.contents)};}".to_string()),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::File(FileValue {
+                path: "/data/count.txt".to_string(),
+                basename: "count.txt".to_string(),
+                nameroot: "count".to_string(),
+                nameext: ".txt".to_string(),
+                size: 3,
+                checksum: None,
+                secondary_files: Vec::new(),
+                contents: Some("  16\n".to_string()),
+            }),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 16),
+            other => panic!("expected Int(16), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_no_expression() {
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn execute_expression_tool_multiple_outputs() {
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some(
+                "${return {\"count\": parseInt(inputs.val), \"name\": inputs.label};}".to_string(),
+            ),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("val".to_string(), ResolvedValue::String("42".to_string()));
+        inputs.insert(
+            "label".to_string(),
+            ResolvedValue::String("test".to_string()),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("count") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 42),
+            other => panic!("expected Int(42), got {:?}", other),
+        }
+        match result.get("name") {
+            Some(ResolvedValue::String(s)) => assert_eq!(s, "test"),
+            other => panic!("expected String(\"test\"), got {:?}", other),
         }
     }
 }

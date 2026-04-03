@@ -88,14 +88,71 @@ pub fn collect_outputs(
             }
         }
 
+        // Load file contents if loadContents is true
+        if let Some(ref binding) = output.output_binding {
+            if binding.load_contents.unwrap_or(false) {
+                for file_val in &mut matched_files {
+                    if let ResolvedValue::File(ref mut fv) = file_val {
+                        let path = std::path::Path::new(&fv.path);
+                        if path.exists() && path.is_file() {
+                            // CWL spec: loadContents reads up to 64 KiB
+                            let contents = std::fs::read_to_string(path).unwrap_or_default();
+                            let truncated = if contents.len() > 65536 {
+                                contents[..65536].to_string()
+                            } else {
+                                contents
+                            };
+                            fv.contents = Some(truncated);
+                        }
+                    }
+                }
+            }
+        }
+
         // Wrap according to output type
-        let value = if output.cwl_type.is_array() {
+        let mut value = if output.cwl_type.is_array() {
             ResolvedValue::Array(matched_files)
         } else if let Some(first) = matched_files.into_iter().next() {
             first
         } else {
             ResolvedValue::Null
         };
+
+        // Handle outputEval if present
+        if let Some(ref binding) = output.output_binding {
+            if let Some(ref output_eval) = binding.output_eval {
+                // Build `self` for outputEval: an array of the matched file values
+                // (CWL spec: self is the array of matched files)
+                let self_val = match &value {
+                    ResolvedValue::Array(arr) => ResolvedValue::Array(arr.clone()),
+                    ResolvedValue::File(_) | ResolvedValue::Directory(_) => {
+                        ResolvedValue::Array(vec![value.clone()])
+                    }
+                    _ => ResolvedValue::Array(vec![]),
+                };
+
+                // Try simple parameter reference resolution first
+                let eval_str = output_eval.trim();
+
+                // Pattern: $(self[0].contents) or similar simple param refs
+                if eval_str.starts_with("$(") && eval_str.ends_with(')') {
+                    let inner = &eval_str[2..eval_str.len() - 1];
+                    if let Some(resolved) =
+                        eval_output_eval_param(inner, &self_val, inputs, runtime)
+                    {
+                        value = resolved;
+                    }
+                }
+                // Pattern: ${return parseInt(self[0].contents);} etc
+                else if eval_str.starts_with("${") && eval_str.ends_with('}') {
+                    if let Some(resolved) =
+                        eval_output_eval_js(eval_str, &self_val, inputs, runtime)
+                    {
+                        value = resolved;
+                    }
+                }
+            }
+        }
 
         result.insert(name.clone(), value);
     }
@@ -217,6 +274,173 @@ fn find_auto_generated_file(workdir: &Path, suffix: &str) -> Result<ResolvedValu
     Ok(ResolvedValue::Null)
 }
 
+/// Evaluate a simple parameter reference in outputEval context.
+///
+/// Supports patterns like:
+///   - `self[0].contents` -> contents of first matched file
+///   - `self[0].size` -> size of first matched file
+///   - `self[0].path` -> path of first matched file
+///   - `self.length` -> number of matched files
+///   - `inputs.X` -> input value
+fn eval_output_eval_param(
+    inner: &str,
+    self_val: &ResolvedValue,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<ResolvedValue> {
+    let inner = inner.trim();
+
+    // self[N].property
+    if inner.starts_with("self[") {
+        if let Some(bracket_end) = inner.find(']') {
+            let idx_str = &inner[5..bracket_end];
+            let idx: usize = idx_str.parse().ok()?;
+            let rest = &inner[bracket_end + 1..];
+
+            if let ResolvedValue::Array(arr) = self_val {
+                let item = arr.get(idx)?;
+                if rest.is_empty() {
+                    return Some(item.clone());
+                }
+                let property = rest.strip_prefix('.')?;
+                match item {
+                    ResolvedValue::File(fv) | ResolvedValue::Directory(fv) => match property {
+                        "contents" => {
+                            Some(ResolvedValue::String(fv.contents.clone().unwrap_or_default()))
+                        }
+                        "path" => Some(ResolvedValue::String(fv.path.clone())),
+                        "basename" => Some(ResolvedValue::String(fv.basename.clone())),
+                        "nameroot" => Some(ResolvedValue::String(fv.nameroot.clone())),
+                        "nameext" => Some(ResolvedValue::String(fv.nameext.clone())),
+                        "size" => Some(ResolvedValue::Int(fv.size as i64)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if inner == "self.length" || inner == "self.length" {
+        if let ResolvedValue::Array(arr) = self_val {
+            Some(ResolvedValue::Int(arr.len() as i64))
+        } else {
+            None
+        }
+    } else if inner == "self" {
+        Some(self_val.clone())
+    } else if let Some(rest) = inner.strip_prefix("inputs.") {
+        // Delegate to param module
+        let resolved_str = param::resolve_param_refs(
+            &format!("$(inputs.{})", rest),
+            inputs,
+            runtime,
+            Some(self_val),
+        );
+        // Try to convert back to a typed value
+        if resolved_str == "null" {
+            Some(ResolvedValue::Null)
+        } else if let Ok(n) = resolved_str.parse::<i64>() {
+            Some(ResolvedValue::Int(n))
+        } else if let Ok(f) = resolved_str.parse::<f64>() {
+            Some(ResolvedValue::Float(f))
+        } else {
+            Some(ResolvedValue::String(resolved_str))
+        }
+    } else {
+        None
+    }
+}
+
+/// Evaluate a simple JS-like expression in outputEval context.
+///
+/// Supports patterns like:
+///   - `${return parseInt(self[0].contents);}`
+///   - `${return parseFloat(self[0].contents);}`
+///   - `${return self[0].contents;}`
+fn eval_output_eval_js(
+    expr: &str,
+    self_val: &ResolvedValue,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<ResolvedValue> {
+    let inner = expr.strip_prefix("${")?.strip_suffix('}')?.trim();
+    let body = inner.strip_prefix("return")?.trim();
+    let body = body.strip_suffix(';').unwrap_or(body).trim();
+
+    // parseInt(...)
+    if let Some(parse_inner) = body
+        .strip_prefix("parseInt(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_output_eval_sub_expr(parse_inner.trim(), self_val, inputs, runtime)?;
+        let s = match &inner_val {
+            ResolvedValue::String(s) => s.clone(),
+            ResolvedValue::Int(n) => return Some(ResolvedValue::Int(*n)),
+            ResolvedValue::Float(f) => return Some(ResolvedValue::Int(*f as i64)),
+            _ => return None,
+        };
+        // parseInt in JS stops at first non-digit
+        let s = s.trim();
+        let numeric: String = if s.starts_with('-') {
+            std::iter::once('-')
+                .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                .collect()
+        } else {
+            s.chars().take_while(|c| c.is_ascii_digit()).collect()
+        };
+        let n = numeric.parse::<i64>().ok()?;
+        return Some(ResolvedValue::Int(n));
+    }
+
+    // parseFloat(...)
+    if let Some(parse_inner) = body
+        .strip_prefix("parseFloat(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_output_eval_sub_expr(parse_inner.trim(), self_val, inputs, runtime)?;
+        let f = match &inner_val {
+            ResolvedValue::String(s) => s.trim().parse::<f64>().ok()?,
+            ResolvedValue::Int(n) => *n as f64,
+            ResolvedValue::Float(f) => *f,
+            _ => return None,
+        };
+        return Some(ResolvedValue::Float(f));
+    }
+
+    // Simple expression
+    eval_output_eval_sub_expr(body, self_val, inputs, runtime)
+}
+
+/// Evaluate a sub-expression within outputEval JS context.
+fn eval_output_eval_sub_expr(
+    expr: &str,
+    self_val: &ResolvedValue,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<ResolvedValue> {
+    let expr = expr.trim();
+
+    // self[N].property
+    if expr.starts_with("self[") || expr == "self" || expr.starts_with("self.") {
+        eval_output_eval_param(expr, self_val, inputs, runtime)
+    } else if expr.starts_with("inputs.") {
+        eval_output_eval_param(expr, self_val, inputs, runtime)
+    } else if let Ok(n) = expr.parse::<i64>() {
+        Some(ResolvedValue::Int(n))
+    } else if let Ok(f) = expr.parse::<f64>() {
+        Some(ResolvedValue::Float(f))
+    } else if (expr.starts_with('"') && expr.ends_with('"'))
+        || (expr.starts_with('\'') && expr.ends_with('\''))
+    {
+        Some(ResolvedValue::String(expr[1..expr.len() - 1].to_string()))
+    } else {
+        None
+    }
+}
+
 /// Strip the last extension from a path. If no extension, return unchanged.
 fn strip_extension(path: &Path) -> PathBuf {
     match path.extension() {
@@ -254,6 +478,7 @@ mod tests {
                 size: 1024,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
         inputs
@@ -335,6 +560,8 @@ mod tests {
                 cwl_type: CwlType::Single("File".to_string()),
                 output_binding: Some(OutputBinding {
                     glob: GlobPattern::Single("*.txt".to_string()),
+                    load_contents: None,
+                    output_eval: None,
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
@@ -468,6 +695,222 @@ mod tests {
                 assert!(fv.basename.ends_with(".stderr"));
             }
             other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    // -- loadContents tests --------------------------------------------------
+
+    #[test]
+    fn collect_outputs_load_contents() {
+        use crate::model::{CommandLineTool, CwlType, OutputBinding, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        // Create test file with known contents
+        fs::write(workdir.join("count.txt"), "  42\n").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "outfile".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("File".to_string()),
+                output_binding: Some(OutputBinding {
+                    glob: GlobPattern::Single("count.txt".to_string()),
+                    load_contents: Some(true),
+                    output_eval: None,
+                }),
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("echo".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("outfile").unwrap() {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.basename, "count.txt");
+                assert!(fv.contents.is_some());
+                assert_eq!(fv.contents.as_ref().unwrap(), "  42\n");
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn collect_outputs_load_contents_false() {
+        use crate::model::{CommandLineTool, CwlType, OutputBinding, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        fs::write(workdir.join("data.txt"), "some data").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "outfile".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("File".to_string()),
+                output_binding: Some(OutputBinding {
+                    glob: GlobPattern::Single("data.txt".to_string()),
+                    load_contents: Some(false),
+                    output_eval: None,
+                }),
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("echo".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("outfile").unwrap() {
+            ResolvedValue::File(fv) => {
+                assert_eq!(fv.basename, "data.txt");
+                assert!(fv.contents.is_none());
+            }
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn collect_outputs_output_eval_parse_int() {
+        use crate::model::{CommandLineTool, CwlType, OutputBinding, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        fs::write(workdir.join("count.txt"), "  16\n").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "count".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("int".to_string()),
+                output_binding: Some(OutputBinding {
+                    glob: GlobPattern::Single("count.txt".to_string()),
+                    load_contents: Some(true),
+                    output_eval: Some("${return parseInt(self[0].contents);}".to_string()),
+                }),
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("wc".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("count").unwrap() {
+            ResolvedValue::Int(n) => assert_eq!(*n, 16),
+            other => panic!("expected Int(16), got {:?}", other),
+        }
+    }
+
+    // -- outputEval with parameter reference ----------------------------------
+
+    #[test]
+    fn collect_outputs_output_eval_self_contents() {
+        use crate::model::{CommandLineTool, CwlType, OutputBinding, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        fs::write(workdir.join("result.txt"), "hello world").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "text".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("string".to_string()),
+                output_binding: Some(OutputBinding {
+                    glob: GlobPattern::Single("result.txt".to_string()),
+                    load_contents: Some(true),
+                    output_eval: Some("$(self[0].contents)".to_string()),
+                }),
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("echo".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("text").unwrap() {
+            ResolvedValue::String(s) => assert_eq!(s, "hello world"),
+            other => panic!("expected String(\"hello world\"), got {:?}", other),
         }
     }
 }

@@ -310,6 +310,7 @@ mod tests {
                 size: 100,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
 
@@ -340,6 +341,7 @@ mod tests {
                 size: 50,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
 
@@ -395,6 +397,7 @@ outputs: {}
                 size: 3_000_000_000,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
 
@@ -524,6 +527,7 @@ outputs: {}
                 size: 1000,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
 
@@ -672,6 +676,7 @@ stdin: $(inputs.file1.path)
                 size: 100,
                 checksum: None,
                 secondary_files: Vec::new(),
+                contents: None,
             }),
         );
         let cmd = build_command(&tool, &inputs, &basic_runtime());
