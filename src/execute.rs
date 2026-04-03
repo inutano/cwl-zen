@@ -122,7 +122,7 @@ pub fn execute_tool(
 
         let req = ContainerExecRequest {
             image: image.clone(),
-            command: resolved_cmd.command_line.clone(),
+            args: resolved_cmd.args.clone(),
             use_shell: resolved_cmd.use_shell,
             workdir: workdir.to_path_buf(),
             mounts,
@@ -138,16 +138,15 @@ pub fn execute_tool(
         // Direct execution (no container)
         let mut cmd = if resolved_cmd.use_shell {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(&resolved_cmd.command_line);
+            c.arg("-c").arg(&resolved_cmd.command_line());
             c
         } else {
-            let parts: Vec<&str> = resolved_cmd.command_line.split_whitespace().collect();
-            if parts.is_empty() {
+            if resolved_cmd.args.is_empty() {
                 bail!("empty command line for step '{}'", step_name);
             }
-            let mut c = Command::new(parts[0]);
-            for part in &parts[1..] {
-                c.arg(part);
+            let mut c = Command::new(&resolved_cmd.args[0]);
+            for arg in &resolved_cmd.args[1..] {
+                c.arg(arg);
             }
             c
         };

@@ -14,7 +14,7 @@ use crate::model::{FileValue, ResolvedValue};
 /// A request to execute a command inside a container.
 pub struct ContainerExecRequest {
     pub image: String,
-    pub command: String,
+    pub args: Vec<String>,
     pub use_shell: bool,
     pub workdir: PathBuf,
     pub mounts: Vec<Mount>,
@@ -113,11 +113,10 @@ impl ContainerEngine for OciEngine {
         cmd.arg(&req.image);
 
         if req.use_shell {
-            cmd.args(["sh", "-c", &req.command]);
+            cmd.args(["sh", "-c", &req.args.join(" ")]);
         } else {
-            // Split command on whitespace for non-shell execution
-            for token in req.command.split_whitespace() {
-                cmd.arg(token);
+            for arg in &req.args {
+                cmd.arg(arg);
             }
         }
 
@@ -202,10 +201,10 @@ impl ContainerEngine for SifEngine {
         cmd.arg(&req.image);
 
         if req.use_shell {
-            cmd.args(["sh", "-c", &req.command]);
+            cmd.args(["sh", "-c", &req.args.join(" ")]);
         } else {
-            for token in req.command.split_whitespace() {
-                cmd.arg(token);
+            for arg in &req.args {
+                cmd.arg(arg);
             }
         }
 

@@ -9,13 +9,20 @@ use crate::parse;
 /// A fully resolved command ready for execution.
 #[derive(Debug, Clone)]
 pub struct ResolvedCommand {
-    pub command_line: String,
+    pub args: Vec<String>,
     pub use_shell: bool,
     pub docker_image: Option<String>,
     pub cores: u32,
     pub ram: u64,
     pub stdout_file: Option<String>,
     pub network_access: bool,
+}
+
+impl ResolvedCommand {
+    /// Get command line as a single string (for shell mode or display).
+    pub fn command_line(&self) -> String {
+        self.args.join(" ")
+    }
 }
 
 /// Build a resolved command from a parsed CommandLineTool, resolved inputs, and
@@ -45,16 +52,16 @@ pub fn build_command(
         tmpdir: runtime.tmpdir.clone(),
     };
 
-    let mut parts: Vec<(i32, String)> = Vec::new();
+    let mut parts: Vec<(i32, Vec<String>)> = Vec::new();
 
-    // 1. baseCommand parts at position -1000
+    // 1. baseCommand parts at position -1000 (each as a separate token)
     match &tool.base_command {
         BaseCommand::Single(s) => {
-            parts.push((-1000, s.clone()));
+            parts.push((-1000, vec![s.clone()]));
         }
         BaseCommand::Array(arr) => {
             for s in arr {
-                parts.push((-1000, s.clone()));
+                parts.push((-1000, vec![s.clone()]));
             }
         }
         BaseCommand::None => {}
@@ -66,28 +73,28 @@ pub fn build_command(
             Argument::String(s) => {
                 let resolved =
                     param::resolve_param_refs(s, inputs, &effective_runtime, None);
-                parts.push((0, resolved));
+                parts.push((0, vec![resolved]));
             }
             Argument::Structured(entry) => {
                 let position = entry.position.unwrap_or(0);
                 let value = if let Some(ref vf) = entry.value_from {
                     param::resolve_param_refs(vf, inputs, &effective_runtime, None)
+                        .trim_end()
+                        .to_string()
                 } else {
                     String::new()
                 };
-                let text = if let Some(ref prefix) = entry.prefix {
+                let tokens = if let Some(ref prefix) = entry.prefix {
                     if value.is_empty() {
-                        prefix.clone()
+                        vec![prefix.clone()]
                     } else {
-                        format!("{} {}", prefix, value)
+                        // Arguments always separate prefix and value (CWL default)
+                        vec![prefix.clone(), value]
                     }
                 } else {
-                    value
+                    vec![value]
                 };
-                // Trim trailing whitespace (valueFrom may have trailing newline
-                // from YAML literal blocks)
-                let text = text.trim_end().to_string();
-                parts.push((position, text));
+                parts.push((position, tokens));
             }
         }
     }
@@ -128,28 +135,27 @@ pub fn build_command(
 
         let separate = binding.separate.unwrap_or(true);
 
-        let text = if let Some(ref prefix) = binding.prefix {
+        let tokens = if let Some(ref prefix) = binding.prefix {
             if separate {
-                format!("{} {}", prefix, value_str)
+                vec![prefix.clone(), value_str]
             } else {
-                format!("{}{}", prefix, value_str)
+                vec![format!("{}{}", prefix, value_str)]
             }
         } else {
-            value_str
+            vec![value_str]
         };
 
-        parts.push((position, text));
+        parts.push((position, tokens));
     }
 
     // 4. Sort by position (stable sort preserves insertion order for ties)
-    parts.sort_by_key(|&(pos, _)| pos);
+    parts.sort_by_key(|(pos, _)| *pos);
 
-    // 5. Join
-    let command_line = parts
+    // 5. Flatten into ordered arg vector
+    let args: Vec<String> = parts
         .into_iter()
-        .map(|(_, text)| text)
-        .collect::<Vec<_>>()
-        .join(" ");
+        .flat_map(|(_, tokens)| tokens)
+        .collect();
 
     // 6. Resolve stdout
     let stdout_file = tool
@@ -161,7 +167,7 @@ pub fn build_command(
     let network_access = crate::parse::has_network_access(tool);
 
     ResolvedCommand {
-        command_line,
+        args,
         use_shell,
         docker_image,
         cores: effective_runtime.cores,
@@ -217,7 +223,7 @@ mod tests {
         );
 
         let cmd = build_command(&tool, &inputs, &default_runtime());
-        assert_eq!(cmd.command_line, "echo hello");
+        assert_eq!(cmd.command_line(), "echo hello");
         assert!(!cmd.use_shell);
         assert_eq!(cmd.docker_image, None);
         assert_eq!(cmd.stdout_file, Some("output.txt".to_string()));
@@ -246,7 +252,7 @@ mod tests {
         );
 
         let cmd = build_command(&tool, &inputs, &default_runtime());
-        assert_eq!(cmd.command_line, "cat /data/test.txt");
+        assert_eq!(cmd.command_line(), "cat /data/test.txt");
     }
 
     #[test]
@@ -279,14 +285,14 @@ mod tests {
         assert!(cmd.use_shell, "expected use_shell=true");
         // The valueFrom should resolve inputs references
         assert!(
-            cmd.command_line.contains("sample"),
+            cmd.command_line().contains("sample"),
             "expected command to contain 'sample', got: {}",
-            cmd.command_line
+            cmd.command_line()
         );
         assert!(
-            cmd.command_line.contains("/data/input.txt"),
+            cmd.command_line().contains("/data/input.txt"),
             "expected command to contain '/data/input.txt', got: {}",
-            cmd.command_line
+            cmd.command_line()
         );
     }
 
@@ -337,7 +343,7 @@ outputs: {}
         );
         assert_eq!(cmd.cores, 8);
         assert_eq!(cmd.ram, 16384);
-        assert_eq!(cmd.command_line, "bwa /data/ref.fa");
+        assert_eq!(cmd.command_line(), "bwa /data/ref.fa");
     }
 
     #[test]
@@ -365,7 +371,7 @@ outputs: {}
         let mut inputs = HashMap::new();
         inputs.insert("threads".into(), ResolvedValue::Int(8));
         let cmd = build_command(&tool, &inputs, &basic_runtime());
-        assert!(cmd.command_line.contains("--threads=8"));
+        assert!(cmd.command_line().contains("--threads=8"));
     }
 
     #[test]
@@ -409,5 +415,94 @@ outputs: {}
         };
         let cmd = build_command(&tool, &HashMap::new(), &basic_runtime());
         assert!(!cmd.network_access);
+    }
+
+    #[test]
+    fn args_preserved_as_vector() {
+        // Tool with baseCommand: [bwa, mem] and a prefixed input with separate=true
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: [bwa, mem]
+inputs:
+  threads:
+    type: int
+    inputBinding:
+      prefix: "-t"
+      position: 1
+  min_seed:
+    type: int
+    inputBinding:
+      prefix: "-m"
+      position: 2
+  reference:
+    type: File
+    inputBinding:
+      position: 3
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("threads".to_string(), ResolvedValue::Int(4));
+        inputs.insert("min_seed".to_string(), ResolvedValue::Int(3));
+        inputs.insert(
+            "reference".to_string(),
+            ResolvedValue::File(FileValue {
+                path: "/data/ref.fa".to_string(),
+                basename: "ref.fa".to_string(),
+                nameroot: "ref".to_string(),
+                nameext: ".fa".to_string(),
+                size: 1000,
+                checksum: None,
+                secondary_files: Vec::new(),
+            }),
+        );
+
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+
+        // Args should be individual tokens, not a single joined string
+        assert_eq!(
+            cmd.args,
+            vec!["bwa", "mem", "-t", "4", "-m", "3", "/data/ref.fa"]
+        );
+        // command_line() still works for display
+        assert_eq!(cmd.command_line(), "bwa mem -t 4 -m 3 /data/ref.fa");
+    }
+
+    #[test]
+    fn args_separate_false_single_token() {
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+inputs:
+  threads:
+    type: int
+    inputBinding:
+      prefix: "--threads="
+      separate: false
+      position: 1
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert("threads".into(), ResolvedValue::Int(8));
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+
+        // With separate=false, prefix and value should be a single token
+        assert_eq!(cmd.args, vec!["tool", "--threads=8"]);
     }
 }
