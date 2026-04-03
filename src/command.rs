@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    Argument, BaseCommand, CommandLineTool, ResolvedValue, RuntimeContext,
+    Argument, BaseCommand, CommandLineTool, CwlType, ResolvedValue, RuntimeContext,
 };
 use crate::param;
 use crate::parse;
@@ -155,20 +155,55 @@ pub fn build_command(
                     parts.push((position, tokens));
                     continue;
                 } else {
-                    // No itemSeparator: each array element is a separate arg
-                    for item in arr {
-                        let item_str = param::value_to_string(item);
-                        let separate = binding.separate.unwrap_or(true);
-                        let tokens = if let Some(ref prefix) = binding.prefix {
-                            if separate {
-                                vec![prefix.clone(), item_str]
+                    // No itemSeparator: each array element is a separate arg.
+                    // Check for nested inputBinding on the array type definition.
+                    let inner_binding = match &tool_input.cwl_type {
+                        CwlType::ArrayType { inner_binding, .. } => inner_binding.as_ref(),
+                        CwlType::Union(variants) => {
+                            variants.iter().find_map(|v| match v {
+                                CwlType::ArrayType { inner_binding, .. } => inner_binding.as_ref(),
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    };
+
+                    if let Some(ib) = inner_binding {
+                        // Nested binding: outer prefix goes once, then each
+                        // element gets the inner prefix.
+                        if let Some(ref prefix) = binding.prefix {
+                            parts.push((position, vec![prefix.clone()]));
+                        }
+                        for item in arr {
+                            let item_str = param::value_to_string(item);
+                            let sep = ib.separate.unwrap_or(true);
+                            let tokens = if let Some(ref inner_prefix) = ib.prefix {
+                                if sep {
+                                    vec![inner_prefix.clone(), item_str]
+                                } else {
+                                    vec![format!("{}{}", inner_prefix, item_str)]
+                                }
                             } else {
-                                vec![format!("{}{}", prefix, item_str)]
-                            }
-                        } else {
-                            vec![item_str]
-                        };
-                        parts.push((position, tokens));
+                                vec![item_str]
+                            };
+                            parts.push((position, tokens));
+                        }
+                    } else {
+                        // No inner binding: each element gets the outer prefix
+                        for item in arr {
+                            let item_str = param::value_to_string(item);
+                            let separate = binding.separate.unwrap_or(true);
+                            let tokens = if let Some(ref prefix) = binding.prefix {
+                                if separate {
+                                    vec![prefix.clone(), item_str]
+                                } else {
+                                    vec![format!("{}{}", prefix, item_str)]
+                                }
+                            } else {
+                                vec![item_str]
+                            };
+                            parts.push((position, tokens));
+                        }
                     }
                     continue;
                 }
@@ -702,5 +737,143 @@ stderr: error.log
         };
         let cmd = build_command(&tool, &HashMap::new(), &basic_runtime());
         assert_eq!(cmd.stderr_file, Some("error.log".to_string()));
+    }
+
+    #[test]
+    fn nested_prefix_array_type() {
+        // Test nested inputBinding on array type: outer prefix once, inner prefix per element
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+arguments: ["bwa", "mem"]
+inputs:
+  reference:
+    type: File
+    inputBinding:
+      position: 2
+  reads:
+    type:
+      type: array
+      items: File
+      inputBinding:
+        prefix: "-YYY"
+    inputBinding:
+      position: 3
+      prefix: "-XXX"
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "reference".to_string(),
+            ResolvedValue::File(FileValue {
+                path: "chr20.fa".to_string(),
+                basename: "chr20.fa".to_string(),
+                nameroot: "chr20".to_string(),
+                nameext: ".fa".to_string(),
+                size: 123,
+                checksum: None,
+                secondary_files: Vec::new(),
+                contents: None,
+            }),
+        );
+        inputs.insert(
+            "reads".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::File(FileValue {
+                    path: "file1.fastq".to_string(),
+                    basename: "file1.fastq".to_string(),
+                    nameroot: "file1".to_string(),
+                    nameext: ".fastq".to_string(),
+                    size: 100,
+                    checksum: None,
+                    secondary_files: Vec::new(),
+                    contents: None,
+                }),
+                ResolvedValue::File(FileValue {
+                    path: "file2.fastq".to_string(),
+                    basename: "file2.fastq".to_string(),
+                    nameroot: "file2".to_string(),
+                    nameext: ".fastq".to_string(),
+                    size: 200,
+                    checksum: None,
+                    secondary_files: Vec::new(),
+                    contents: None,
+                }),
+            ]),
+        );
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        // Expected: tool bwa mem chr20.fa -XXX -YYY file1.fastq -YYY file2.fastq
+        assert_eq!(
+            cmd.args,
+            vec![
+                "tool", "bwa", "mem", "chr20.fa",
+                "-XXX",
+                "-YYY", "file1.fastq",
+                "-YYY", "file2.fastq",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_prefix_array_no_inner_binding() {
+        // Without inner binding, outer prefix applies per element (existing behavior)
+        let doc = crate::parse::parse_cwl_str(
+            r#"
+cwlVersion: v1.2
+class: CommandLineTool
+baseCommand: tool
+inputs:
+  files:
+    type:
+      type: array
+      items: File
+    inputBinding:
+      position: 1
+      prefix: "-f"
+outputs: {}
+"#,
+        )
+        .unwrap();
+        let tool = match doc {
+            CwlDocument::CommandLineTool(t) => t,
+            _ => panic!("expected CommandLineTool"),
+        };
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "files".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::File(FileValue {
+                    path: "a.txt".to_string(),
+                    basename: "a.txt".to_string(),
+                    nameroot: "a".to_string(),
+                    nameext: ".txt".to_string(),
+                    size: 10,
+                    checksum: None,
+                    secondary_files: Vec::new(),
+                    contents: None,
+                }),
+                ResolvedValue::File(FileValue {
+                    path: "b.txt".to_string(),
+                    basename: "b.txt".to_string(),
+                    nameroot: "b".to_string(),
+                    nameext: ".txt".to_string(),
+                    size: 20,
+                    checksum: None,
+                    secondary_files: Vec::new(),
+                    contents: None,
+                }),
+            ]),
+        );
+        let cmd = build_command(&tool, &inputs, &basic_runtime());
+        // Without inner binding: each element gets the outer prefix
+        assert_eq!(cmd.args, vec!["tool", "-f", "a.txt", "-f", "b.txt"]);
     }
 }

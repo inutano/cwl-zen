@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{bail, Result};
 
-use crate::model::{StepInput, Workflow};
+use crate::model::{SourceField, StepInput, StepRun, Workflow};
 
 /// A step in the execution DAG with its dependencies resolved.
 #[derive(Debug, Clone)]
@@ -22,26 +22,45 @@ pub fn build_dag(workflow: &Workflow) -> Result<Vec<DagStep>> {
     let mut dag_steps: HashMap<&str, DagStep> = HashMap::new();
     for (name, step) in &workflow.steps {
         let mut depends_on = Vec::new();
+
+        // Collect all source strings from the step inputs
+        let mut sources: Vec<&str> = Vec::new();
         for input_val in step.inputs.values() {
-            let source = match input_val {
-                StepInput::Source(s) => Some(s.as_str()),
-                StepInput::Structured(entry) => entry.source.as_deref(),
-            };
-            if let Some(src) = source {
-                if let Some(dep_name) = src.split('/').next() {
-                    if step_names.contains(dep_name) && !depends_on.contains(&dep_name.to_string())
-                    {
-                        depends_on.push(dep_name.to_string());
+            match input_val {
+                StepInput::Source(s) => sources.push(s.as_str()),
+                StepInput::Structured(entry) => match &entry.source {
+                    Some(SourceField::Single(s)) => sources.push(s.as_str()),
+                    Some(SourceField::Multiple(v)) => {
+                        for s in v {
+                            sources.push(s.as_str());
+                        }
                     }
+                    None => {}
+                },
+            }
+        }
+
+        for src in sources {
+            if let Some(dep_name) = src.split('/').next() {
+                if step_names.contains(dep_name) && !depends_on.contains(&dep_name.to_string())
+                {
+                    depends_on.push(dep_name.to_string());
                 }
             }
         }
+
         depends_on.sort(); // deterministic ordering
+
+        let tool_path = match &step.run {
+            StepRun::Path(p) => p.clone(),
+            StepRun::Inline(_) => "#inline".to_string(),
+        };
+
         dag_steps.insert(
             name.as_str(),
             DagStep {
                 name: name.clone(),
-                tool_path: step.run.clone(),
+                tool_path,
                 depends_on,
             },
         );
@@ -202,7 +221,7 @@ mod tests {
         }
         WorkflowStep {
             id: None,
-            run: run.to_string(),
+            run: StepRun::Path(run.to_string()),
             inputs,
             out: StepOutputList(vec!["output".to_string()]),
             scatter: None,
@@ -326,5 +345,96 @@ mod tests {
         for step in &dag[1..3] {
             assert_eq!(step.depends_on, vec!["A"]);
         }
+    }
+
+    // -- Test 5: step with array source (multiple sources) --------------------
+
+    #[test]
+    fn dag_multiple_sources() {
+        let mut steps = HashMap::new();
+        steps.insert(
+            "step1".to_string(),
+            make_step("a.cwl", &[("in1", "workflow_input")]),
+        );
+        steps.insert(
+            "step2".to_string(),
+            make_step("b.cwl", &[("in1", "workflow_input")]),
+        );
+
+        // step3 uses array source: [step1/output, step2/output]
+        let mut step3_inputs = HashMap::new();
+        step3_inputs.insert(
+            "merged".to_string(),
+            StepInput::Structured(StepInputEntry {
+                id: None,
+                source: Some(SourceField::Multiple(vec![
+                    "step1/output".to_string(),
+                    "step2/output".to_string(),
+                ])),
+                value_from: None,
+                default: None,
+                link_merge: None,
+            }),
+        );
+        steps.insert(
+            "step3".to_string(),
+            WorkflowStep {
+                id: None,
+                run: StepRun::Path("c.cwl".to_string()),
+                inputs: step3_inputs,
+                out: StepOutputList(vec!["output".to_string()]),
+                scatter: None,
+                scatter_method: None,
+            },
+        );
+
+        let wf = make_workflow(steps);
+        let dag = build_dag(&wf).unwrap();
+        assert_eq!(dag.len(), 3);
+
+        // step3 should depend on both step1 and step2
+        let step3 = dag.iter().find(|s| s.name == "step3").unwrap();
+        assert!(step3.depends_on.contains(&"step1".to_string()));
+        assert!(step3.depends_on.contains(&"step2".to_string()));
+    }
+
+    // -- Test 6: inline tool definition (StepRun::Inline) ---------------------
+
+    #[test]
+    fn dag_inline_tool() {
+        let mut steps = HashMap::new();
+        steps.insert(
+            "inline_step".to_string(),
+            WorkflowStep {
+                id: None,
+                run: StepRun::Inline(Box::new(CwlDocument::CommandLineTool(
+                    crate::model::CommandLineTool {
+                        cwl_version: None,
+                        label: None,
+                        doc: None,
+                        base_command: crate::model::BaseCommand::Single("echo".to_string()),
+                        arguments: Vec::new(),
+                        inputs: HashMap::new(),
+                        outputs: HashMap::new(),
+                        requirements: Vec::new(),
+                        hints: Vec::new(),
+                        stdout: None,
+                        stdin: None,
+                        stderr: None,
+                    },
+                ))),
+                inputs: HashMap::new(),
+                out: StepOutputList(vec!["output".to_string()]),
+                scatter: None,
+                scatter_method: None,
+            },
+        );
+
+        let wf = make_workflow(steps);
+        let dag = build_dag(&wf).unwrap();
+        assert_eq!(dag.len(), 1);
+        assert_eq!(dag[0].name, "inline_step");
+        assert_eq!(dag[0].tool_path, "#inline");
+        assert!(dag[0].depends_on.is_empty());
     }
 }

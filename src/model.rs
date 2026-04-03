@@ -314,6 +314,9 @@ pub struct ToolInput {
 
     #[serde(default)]
     pub default: Option<serde_yaml::Value>,
+
+    #[serde(default)]
+    pub load_contents: Option<bool>,
 }
 
 impl HasId for ToolInput {
@@ -329,6 +332,7 @@ impl HasId for ToolInput {
             secondary_files: Vec::new(),
             doc: None,
             default: None,
+            load_contents: None,
         })
     }
 }
@@ -432,8 +436,12 @@ pub enum CwlType {
     Single(String),
     /// A union type: ["null", "File"]
     Union(Vec<CwlType>),
-    /// A structured array type: {type: array, items: File}
-    ArrayType { items: Box<CwlType> },
+    /// A structured array type: {type: array, items: File, inputBinding?: ...}
+    ArrayType {
+        items: Box<CwlType>,
+        /// Optional per-element inputBinding from the type definition.
+        inner_binding: Option<InputBinding>,
+    },
 }
 
 impl<'de> Deserialize<'de> for CwlType {
@@ -472,9 +480,10 @@ impl<'de> Deserialize<'de> for CwlType {
             where
                 M: MapAccess<'de>,
             {
-                // Parse {type: "array", items: <CwlType>}
+                // Parse {type: "array", items: <CwlType>, inputBinding?: ...}
                 let mut type_field: Option<String> = None;
                 let mut items_field: Option<CwlType> = None;
+                let mut inner_binding: Option<InputBinding> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -483,6 +492,9 @@ impl<'de> Deserialize<'de> for CwlType {
                         }
                         "items" => {
                             items_field = Some(map.next_value()?);
+                        }
+                        "inputBinding" => {
+                            inner_binding = Some(map.next_value()?);
                         }
                         _ => {
                             let _: serde_yaml::Value = map.next_value()?;
@@ -494,6 +506,7 @@ impl<'de> Deserialize<'de> for CwlType {
                     (Some("array"), Some(items)) => {
                         Ok(CwlType::ArrayType {
                             items: Box::new(items),
+                            inner_binding,
                         })
                     }
                     (Some(t), _) => {
@@ -529,7 +542,7 @@ impl CwlType {
                 }
                 "null"
             }
-            CwlType::ArrayType { items } => items.base_type(),
+            CwlType::ArrayType { items, .. } => items.base_type(),
         }
     }
 
@@ -679,13 +692,50 @@ impl HasId for WorkflowOutput {
 // Workflow steps
 // ---------------------------------------------------------------------------
 
+/// `run` field of a workflow step: either a path string or an inline tool definition.
+#[derive(Debug, Clone, Serialize)]
+pub enum StepRun {
+    Path(String),
+    Inline(Box<CwlDocument>),
+}
+
+impl PartialEq<&str> for StepRun {
+    fn eq(&self, other: &&str) -> bool {
+        match self {
+            StepRun::Path(p) => p.as_str() == *other,
+            StepRun::Inline(_) => false,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StepRun {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match &value {
+            serde_yaml::Value::String(s) => Ok(StepRun::Path(s.clone())),
+            serde_yaml::Value::Mapping(_) => {
+                let doc: CwlDocument =
+                    serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(StepRun::Inline(Box::new(doc)))
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "expected string or mapping for step 'run', got {:?}",
+                value
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowStep {
     #[serde(default)]
     pub id: Option<String>,
 
-    pub run: String,
+    pub run: StepRun,
 
     #[serde(rename = "in", default, deserialize_with = "deserialize_map_or_list")]
     pub inputs: HashMap<String, StepInput>,
@@ -780,8 +830,30 @@ impl<'de> Deserialize<'de> for StepInput {
                     serde_yaml::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(StepInput::Structured(entry))
             }
+            serde_yaml::Value::Sequence(seq) => {
+                // Shorthand: `input_name: [source1, source2]`
+                // is equivalent to `input_name: { source: [source1, source2] }`
+                let mut sources = Vec::new();
+                for item in seq {
+                    if let serde_yaml::Value::String(s) = item {
+                        sources.push(s.clone());
+                    } else {
+                        return Err(serde::de::Error::custom(format!(
+                            "expected string in source array, got {:?}",
+                            item
+                        )));
+                    }
+                }
+                Ok(StepInput::Structured(StepInputEntry {
+                    id: None,
+                    source: Some(SourceField::Multiple(sources)),
+                    value_from: None,
+                    default: None,
+                    link_merge: None,
+                }))
+            }
             _ => Err(serde::de::Error::custom(format!(
-                "expected string or mapping for step input, got {:?}",
+                "expected string, mapping, or array for step input, got {:?}",
                 value
             ))),
         }
@@ -797,6 +869,43 @@ impl HasId for StepInput {
     }
 }
 
+/// The `source` field on a step input: can be a single string or array of strings.
+#[derive(Debug, Clone, Serialize)]
+pub enum SourceField {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for SourceField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match &value {
+            serde_yaml::Value::String(s) => Ok(SourceField::Single(s.clone())),
+            serde_yaml::Value::Sequence(seq) => {
+                let mut sources = Vec::new();
+                for item in seq {
+                    if let serde_yaml::Value::String(s) = item {
+                        sources.push(s.clone());
+                    } else {
+                        return Err(serde::de::Error::custom(format!(
+                            "expected string in source array, got {:?}",
+                            item
+                        )));
+                    }
+                }
+                Ok(SourceField::Multiple(sources))
+            }
+            _ => Err(serde::de::Error::custom(format!(
+                "expected string or array for source, got {:?}",
+                value
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StepInputEntry {
@@ -804,13 +913,16 @@ pub struct StepInputEntry {
     pub id: Option<String>,
 
     #[serde(default)]
-    pub source: Option<String>,
+    pub source: Option<SourceField>,
 
     #[serde(default)]
     pub value_from: Option<String>,
 
     #[serde(default)]
     pub default: Option<serde_yaml::Value>,
+
+    #[serde(default)]
+    pub link_merge: Option<String>,
 }
 
 /// Scatter can target a single input or multiple inputs.
@@ -1463,6 +1575,136 @@ outputs: {}
                 assert_eq!(tool.inputs["reads"].cwl_type.base_type(), "File");
             }
             _ => panic!("Expected CommandLineTool"),
+        }
+    }
+
+    // -- Step input parsing: sequence shorthand for source ---------------------
+
+    #[test]
+    fn step_input_sequence_source() {
+        let yaml = r#"
+class: Workflow
+cwlVersion: v1.2
+inputs:
+  file1: File
+  file2: File
+outputs:
+  count_output:
+    type: int
+    outputSource: step1/output
+steps:
+  step1:
+    run: wc.cwl
+    in:
+      file1: [file1, file2]
+    out: [output]
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::Workflow(wf) => {
+                let step = &wf.steps["step1"];
+                match &step.inputs["file1"] {
+                    StepInput::Structured(entry) => match &entry.source {
+                        Some(SourceField::Multiple(sources)) => {
+                            assert_eq!(sources.len(), 2);
+                            assert_eq!(sources[0], "file1");
+                            assert_eq!(sources[1], "file2");
+                        }
+                        other => panic!("expected Multiple source, got {:?}", other),
+                    },
+                    other => panic!("expected Structured step input, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Workflow"),
+        }
+    }
+
+    // -- Step input parsing: structured source array ---------------------------
+
+    #[test]
+    fn step_input_structured_source_array() {
+        let yaml = r#"
+class: Workflow
+cwlVersion: v1.2
+inputs:
+  file1: File
+  file2: File
+outputs: []
+steps:
+  step1:
+    run: wc.cwl
+    in:
+      file1:
+        source: [file1, file2]
+        linkMerge: merge_nested
+    out: [output]
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::Workflow(wf) => {
+                let step = &wf.steps["step1"];
+                match &step.inputs["file1"] {
+                    StepInput::Structured(entry) => {
+                        match &entry.source {
+                            Some(SourceField::Multiple(sources)) => {
+                                assert_eq!(sources.len(), 2);
+                            }
+                            other => panic!("expected Multiple source, got {:?}", other),
+                        }
+                        assert_eq!(entry.link_merge.as_deref(), Some("merge_nested"));
+                    }
+                    other => panic!("expected Structured step input, got {:?}", other),
+                }
+            }
+            _ => panic!("Expected Workflow"),
+        }
+    }
+
+    // -- Inline tool definition parsing ----------------------------------------
+
+    #[test]
+    fn step_run_inline_tool() {
+        let yaml = r#"
+class: Workflow
+cwlVersion: v1.2
+inputs:
+  file1: File
+outputs:
+  out:
+    type: File
+    outputSource: step1/output
+steps:
+  step1:
+    run:
+      class: CommandLineTool
+      baseCommand: echo
+      inputs:
+        file1:
+          type: File
+          inputBinding: {}
+      outputs:
+        output:
+          type: stdout
+      stdout: output.txt
+    in:
+      file1: file1
+    out: [output]
+"#;
+        let doc: CwlDocument = serde_yaml::from_str(yaml).unwrap();
+        match doc {
+            CwlDocument::Workflow(wf) => {
+                let step = &wf.steps["step1"];
+                match &step.run {
+                    StepRun::Inline(doc) => match doc.as_ref() {
+                        CwlDocument::CommandLineTool(tool) => {
+                            assert!(matches!(tool.base_command, BaseCommand::Single(ref s) if s == "echo"));
+                        }
+                        _ => panic!("expected CommandLineTool"),
+                    },
+                    StepRun::Path(_) => panic!("expected Inline, got Path"),
+                }
+            }
+            _ => panic!("Expected Workflow"),
         }
     }
 }

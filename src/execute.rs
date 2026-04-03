@@ -10,7 +10,8 @@ use crate::command;
 use crate::container::{self, ContainerEngine, ContainerExecRequest};
 use crate::dag::DagStep;
 use crate::model::{
-    CwlDocument, ExpressionTool, FileValue, ResolvedValue, RuntimeContext, StepInput, Workflow,
+    CwlDocument, ExpressionTool, FileValue, ResolvedValue, RuntimeContext, SourceField, StepInput,
+    StepRun, Workflow,
 };
 use crate::param;
 use crate::parse;
@@ -83,10 +84,17 @@ pub fn execute_tool(
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log_dir: {}", log_dir.display()))?;
 
-    // 1b. Merge tool-level defaults for missing inputs
+    // 1b. Merge tool-level defaults for missing or null inputs.
+    // CWL spec: "If a value of null is explicitly provided for a required
+    // parameter, the default value for that parameter is used."
     let mut inputs = inputs.clone();
     for (name, input_def) in &tool.inputs {
-        if !inputs.contains_key(name) {
+        let needs_default = match inputs.get(name) {
+            None => true,
+            Some(ResolvedValue::Null) => true,
+            _ => false,
+        };
+        if needs_default {
             if let Some(default) = &input_def.default {
                 let mut resolved = yaml_to_resolved(default);
                 // If it's a File default with a relative path, resolve against tool's directory
@@ -100,6 +108,18 @@ pub fn execute_tool(
                     }
                 }
                 inputs.insert(name.clone(), resolved);
+            }
+        }
+    }
+
+    // 1c. Validate: required (non-optional) inputs must not be null after default merge.
+    for (name, input_def) in &tool.inputs {
+        if !input_def.cwl_type.is_optional() {
+            if let Some(ResolvedValue::Null) = inputs.get(name) {
+                bail!(
+                    "required input '{}' is null and has no default value",
+                    name
+                );
             }
         }
     }
@@ -331,11 +351,16 @@ pub fn execute_workflow(
     fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log dir: {}", log_dir.display()))?;
 
-    // Merge workflow defaults: if an input is not provided, use the workflow
-    // input's default value (if declared).
+    // Merge workflow defaults: if an input is not provided or is null, use the
+    // workflow input's default value (if declared).
     let mut inputs = inputs.clone();
     for (name, wf_input) in &workflow.inputs {
-        if !inputs.contains_key(name) {
+        let needs_default = match inputs.get(name) {
+            None => true,
+            Some(ResolvedValue::Null) => true,
+            _ => false,
+        };
+        if needs_default {
             if let Some(default) = &wf_input.default {
                 inputs.insert(name.clone(), yaml_to_resolved(default));
             }
@@ -356,15 +381,28 @@ pub fn execute_workflow(
         let step_start = Utc::now();
         let step_name = &dag_step.name;
 
-        // a. Parse the tool CWL file (relative to workflow directory)
-        let tool_path = wf_dir.join(&dag_step.tool_path);
-        let doc = parse::parse_cwl(&tool_path)
-            .with_context(|| format!("parsing tool for step '{}': {}", step_name, tool_path.display()))?;
-        // b. Resolve step inputs (needed by both CommandLineTool and ExpressionTool)
+        // a. Look up the step definition
         let wf_step = workflow
             .steps
             .get(step_name)
             .with_context(|| format!("step '{}' not found in workflow", step_name))?;
+
+        // b. Parse the tool CWL file (relative to workflow directory) or use inline
+        let (doc, tool_path) = match &wf_step.run {
+            StepRun::Path(p) => {
+                let tp = wf_dir.join(p);
+                let d = parse::parse_cwl(&tp)
+                    .with_context(|| format!("parsing tool for step '{}': {}", step_name, tp.display()))?;
+                (d, tp)
+            }
+            StepRun::Inline(inline_doc) => {
+                // Inline tool definition — use the workflow directory as the tool path
+                let tp = wf_dir.join("#inline");
+                (*inline_doc.clone(), tp)
+            }
+        };
+
+        // c. Resolve step inputs (needed by both CommandLineTool and ExpressionTool)
         let step_inputs = resolve_step_inputs(
             &wf_step.inputs,
             &inputs,
@@ -375,6 +413,7 @@ pub fn execute_workflow(
                 outdir: outdir.to_string_lossy().to_string(),
                 tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
             },
+            Some(wf_dir),
         )?;
 
         // Handle ExpressionTool steps directly (no shell execution needed)
@@ -522,6 +561,49 @@ pub fn execute_expression_tool(
     inputs: &HashMap<String, ResolvedValue>,
     runtime: &RuntimeContext,
 ) -> Result<HashMap<String, ResolvedValue>> {
+    // Merge defaults for missing or null inputs.
+    // CWL spec: "If a value of null is explicitly provided for a required
+    // parameter, the default value for that parameter is used."
+    let mut inputs = inputs.clone();
+    for (name, input_def) in &expr_tool.inputs {
+        let needs_default = match inputs.get(name) {
+            None => true,
+            Some(ResolvedValue::Null) => true,
+            _ => false,
+        };
+        if needs_default {
+            if let Some(default) = &input_def.default {
+                inputs.insert(name.clone(), yaml_to_resolved(default));
+            }
+        }
+    }
+
+    // Validate: required (non-optional) inputs must not be null after default merge.
+    for (name, input_def) in &expr_tool.inputs {
+        if !input_def.cwl_type.is_optional() {
+            if let Some(ResolvedValue::Null) = inputs.get(name) {
+                bail!(
+                    "required input '{}' is null and has no default value",
+                    name
+                );
+            }
+        }
+    }
+
+    // Load file contents for inputs that request loadContents: true
+    for (name, input_def) in &expr_tool.inputs {
+        if input_def.load_contents.unwrap_or(false) {
+            if let Some(ResolvedValue::File(ref mut fv)) = inputs.get_mut(name) {
+                if fv.contents.is_none() && std::path::Path::new(&fv.path).exists() {
+                    // CWL spec: loadContents limited to 64 KiB
+                    let data = std::fs::read_to_string(&fv.path)
+                        .unwrap_or_default();
+                    fv.contents = Some(data);
+                }
+            }
+        }
+    }
+
     let expression = expr_tool
         .expression
         .as_deref()
@@ -535,7 +617,13 @@ pub fn execute_expression_tool(
     // Try to evaluate simple JS-like expressions.
     // Pattern 1: ${return {"key": inputs.x, ...};}
     // Pattern 2: ${return {"key": parseInt(inputs.x.contents)};}
-    if let Some(result) = try_eval_simple_js_return(expression, inputs, runtime) {
+    // Pattern 3: $({'key': expr, ...})  — JS object literal shorthand
+    if let Some(result) = try_eval_simple_js_return(expression, &inputs, runtime) {
+        return Ok(result);
+    }
+
+    // Pattern 3: $({...}) — JS object literal wrapped in $()
+    if let Some(result) = try_eval_dollar_paren_object(expression, &inputs, runtime) {
         return Ok(result);
     }
 
@@ -573,6 +661,48 @@ fn try_eval_simple_js_return(
     let body = body.strip_prefix('{')?.strip_suffix('}')?.trim();
 
     // Parse comma-separated key-value pairs: "key": expr, "key2": expr2
+    let mut result = HashMap::new();
+    let pairs = split_top_level(body, ',');
+
+    for pair in pairs {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        // Split on first ':'
+        let colon_pos = pair.find(':')?;
+        let key = pair[..colon_pos].trim();
+        let val_expr = pair[colon_pos + 1..].trim();
+
+        // Strip quotes from key
+        let key = key
+            .strip_prefix('"')
+            .and_then(|k| k.strip_suffix('"'))
+            .or_else(|| key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+            .unwrap_or(key);
+
+        let resolved = eval_simple_expr(val_expr, inputs, runtime)?;
+        result.insert(key.to_string(), resolved);
+    }
+
+    Some(result)
+}
+
+/// Try to evaluate a `$({key: expr, ...})` pattern (JS object literal in $()).
+fn try_eval_dollar_paren_object(
+    expression: &str,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<HashMap<String, ResolvedValue>> {
+    // Strip $( ... )
+    let inner = expression.strip_prefix("$(")?.strip_suffix(')')?;
+    let inner = inner.trim();
+
+    // Must be a JS object literal: { ... }
+    let body = inner.strip_prefix('{')?.strip_suffix('}')?.trim();
+
+    // Parse comma-separated key-value pairs: 'key': expr, 'key2': expr2
     let mut result = HashMap::new();
     let pairs = split_top_level(body, ',');
 
@@ -685,6 +815,25 @@ fn eval_simple_expr(
 
     // self[0].contents -- for outputEval context (not applicable here but keep pattern)
 
+    // Ternary: condition ? true_expr : false_expr
+    // Must be checked before `inputs.X` to avoid the prefix match consuming
+    // compound expressions like `inputs.x == 'val' ? 1 : 2`.
+    if let Some(q_pos) = find_top_level_char(expr, '?') {
+        let condition = expr[..q_pos].trim();
+        let rest = &expr[q_pos + 1..];
+        // Find the matching ':' at top level
+        if let Some(c_pos) = find_top_level_char(rest, ':') {
+            let true_expr = rest[..c_pos].trim();
+            let false_expr = rest[c_pos + 1..].trim();
+            let cond_result = eval_condition(condition, inputs, _runtime)?;
+            return if cond_result {
+                eval_simple_expr(true_expr, inputs, _runtime)
+            } else {
+                eval_simple_expr(false_expr, inputs, _runtime)
+            };
+        }
+    }
+
     // inputs.X or inputs.X.property
     if let Some(rest) = expr.strip_prefix("inputs.") {
         return resolve_input_value(rest, inputs);
@@ -705,7 +854,70 @@ fn eval_simple_expr(
         return Some(ResolvedValue::Array(arr));
     }
 
+    // Parenthesized expression: strip outer parens and retry
+    if expr.starts_with('(') && expr.ends_with(')') {
+        return eval_simple_expr(&expr[1..expr.len() - 1], inputs, _runtime);
+    }
+
     None
+}
+
+/// Find the position of a character at top-level (depth 0) in a string.
+fn find_top_level_char(s: &str, target: char) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        if ch == '(' || ch == '[' || ch == '{' {
+            depth += 1;
+        } else if ch == ')' || ch == ']' || ch == '}' {
+            depth -= 1;
+        } else if ch == target && depth == 0 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Evaluate a simple condition (equality comparison).
+/// Supports: `inputs.X == 'value'`, `inputs.X == "value"`, `inputs.X == number`
+fn eval_condition(
+    condition: &str,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<bool> {
+    let condition = condition.trim();
+    // Check for == or !=
+    if let Some(pos) = condition.find("==") {
+        let lhs = condition[..pos].trim();
+        let rhs = condition[pos + 2..].trim();
+        // Handle === (JS strict equality) by stripping extra =
+        let rhs = rhs.strip_prefix('=').unwrap_or(rhs).trim();
+        let lhs_val = eval_simple_expr(lhs, inputs, runtime)?;
+        let rhs_val = eval_simple_expr(rhs, inputs, runtime)?;
+        return Some(resolved_values_equal(&lhs_val, &rhs_val));
+    }
+    if let Some(pos) = condition.find("!=") {
+        let lhs = condition[..pos].trim();
+        let rhs = condition[pos + 2..].trim();
+        let rhs = rhs.strip_prefix('=').unwrap_or(rhs).trim();
+        let lhs_val = eval_simple_expr(lhs, inputs, runtime)?;
+        let rhs_val = eval_simple_expr(rhs, inputs, runtime)?;
+        return Some(!resolved_values_equal(&lhs_val, &rhs_val));
+    }
+    None
+}
+
+/// Compare two resolved values for equality.
+fn resolved_values_equal(a: &ResolvedValue, b: &ResolvedValue) -> bool {
+    match (a, b) {
+        (ResolvedValue::String(a), ResolvedValue::String(b)) => a == b,
+        (ResolvedValue::Int(a), ResolvedValue::Int(b)) => a == b,
+        (ResolvedValue::Float(a), ResolvedValue::Float(b)) => (a - b).abs() < f64::EPSILON,
+        (ResolvedValue::Bool(a), ResolvedValue::Bool(b)) => a == b,
+        (ResolvedValue::Null, ResolvedValue::Null) => true,
+        (ResolvedValue::Int(a), ResolvedValue::Float(b)) => (*a as f64 - b).abs() < f64::EPSILON,
+        (ResolvedValue::Float(a), ResolvedValue::Int(b)) => (a - *b as f64).abs() < f64::EPSILON,
+        _ => false,
+    }
 }
 
 /// Resolve an `inputs.X` or `inputs.X.property` reference.
@@ -856,32 +1068,82 @@ fn resolve_step_inputs(
     wf_inputs: &HashMap<String, ResolvedValue>,
     step_outputs: &HashMap<String, HashMap<String, ResolvedValue>>,
     runtime: &RuntimeContext,
+    wf_dir: Option<&Path>,
 ) -> Result<HashMap<String, ResolvedValue>> {
     let mut resolved = HashMap::new();
+
+    // Helper: resolve a default value, making relative File paths absolute
+    let resolve_default = |yaml: &serde_yaml::Value| -> ResolvedValue {
+        let mut val = yaml_to_resolved(yaml);
+        if let ResolvedValue::File(ref mut fv) = val {
+            if let Some(dir) = wf_dir {
+                if !fv.path.is_empty() && !Path::new(&fv.path).is_absolute() {
+                    let abs = dir.join(&fv.path);
+                    let abs_str = abs.to_string_lossy().to_string();
+                    *fv = FileValue::from_path(&abs_str);
+                }
+            }
+        }
+        val
+    };
 
     for (input_name, step_input) in step_in {
         let value = match step_input {
             StepInput::Source(source) => resolve_source(source, wf_inputs, step_outputs),
             StepInput::Structured(entry) => {
                 // Get base value from source or default
-                let base_value = if let Some(ref source) = entry.source {
-                    let v = resolve_source(source, wf_inputs, step_outputs);
-                    if matches!(v, ResolvedValue::Null) {
-                        // Fall back to default if source resolves to null
-                        entry
-                            .default
-                            .as_ref()
-                            .map(yaml_to_resolved)
-                            .unwrap_or(ResolvedValue::Null)
-                    } else {
-                        v
+                let base_value = match &entry.source {
+                    Some(SourceField::Single(source)) => {
+                        let v = resolve_source(source, wf_inputs, step_outputs);
+                        if matches!(v, ResolvedValue::Null) {
+                            entry
+                                .default
+                                .as_ref()
+                                .map(&resolve_default)
+                                .unwrap_or(ResolvedValue::Null)
+                        } else {
+                            v
+                        }
                     }
-                } else {
-                    entry
+                    Some(SourceField::Multiple(sources)) => {
+                        // Multiple sources: resolve each and combine based on linkMerge
+                        let items: Vec<ResolvedValue> = sources
+                            .iter()
+                            .map(|s| resolve_source(s, wf_inputs, step_outputs))
+                            .collect();
+
+                        match entry.link_merge.as_deref() {
+                            Some("merge_flattened") => {
+                                // Flatten: if any item is an array, concat its elements
+                                let mut flat = Vec::new();
+                                for item in items {
+                                    match item {
+                                        ResolvedValue::Array(arr) => flat.extend(arr),
+                                        other => flat.push(other),
+                                    }
+                                }
+                                ResolvedValue::Array(flat)
+                            }
+                            Some("merge_nested") => {
+                                // Nested: each source value is an element of the outer array
+                                ResolvedValue::Array(items)
+                            }
+                            _ => {
+                                // No linkMerge: if single source, unwrap; otherwise default
+                                // to merge_nested (CWL spec default)
+                                if sources.len() == 1 {
+                                    items.into_iter().next().unwrap_or(ResolvedValue::Null)
+                                } else {
+                                    ResolvedValue::Array(items)
+                                }
+                            }
+                        }
+                    }
+                    None => entry
                         .default
                         .as_ref()
-                        .map(yaml_to_resolved)
-                        .unwrap_or(ResolvedValue::Null)
+                        .map(&resolve_default)
+                        .unwrap_or(ResolvedValue::Null),
                 };
 
                 // If value_from is set, resolve it using wf_inputs as the
@@ -957,7 +1219,7 @@ fn yaml_to_resolved(val: &serde_yaml::Value) -> ResolvedValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ResolvedValue, StepInput, StepInputEntry};
+    use crate::model::{ResolvedValue, SourceField, StepInput, StepInputEntry};
 
     /// Helper: build workflow inputs for testing resolve_source.
     fn test_wf_inputs() -> HashMap<String, ResolvedValue> {
@@ -1047,10 +1309,11 @@ mod tests {
                 source: None,
                 value_from: None,
                 default: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
+                link_merge: None,
             }),
         );
 
-        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime).unwrap();
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime, None).unwrap();
         match resolved.get("threads") {
             Some(ResolvedValue::Int(n)) => assert_eq!(*n, 4),
             other => panic!("expected Int(4), got {:?}", other),
@@ -1076,13 +1339,14 @@ mod tests {
             "greeting".to_string(),
             StepInput::Structured(StepInputEntry {
                 id: None,
-                source: Some("message".to_string()),
+                source: Some(SourceField::Single("message".to_string())),
                 value_from: Some("prefix_$(self)".to_string()),
                 default: None,
+                link_merge: None,
             }),
         );
 
-        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime).unwrap();
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime, None).unwrap();
         match resolved.get("greeting") {
             Some(ResolvedValue::String(s)) => assert_eq!(s, "prefix_hello"),
             other => panic!("expected String(\"prefix_hello\"), got {:?}", other),
@@ -1162,7 +1426,7 @@ mod tests {
             StepInput::Source("align/aligned_sam".to_string()),
         );
 
-        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime).unwrap();
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime, None).unwrap();
 
         match resolved.get("msg") {
             Some(ResolvedValue::String(s)) => assert_eq!(s, "hello"),
@@ -1549,6 +1813,500 @@ path: /data/outdir
         match result.get("name") {
             Some(ResolvedValue::String(s)) => assert_eq!(s, "test"),
             other => panic!("expected String(\"test\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_dollar_paren_object() {
+        // Test $({'output': parseInt(inputs.file1.contents)}) pattern
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some("$({'output': parseInt(inputs.file1.contents)})".to_string()),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::File(FileValue {
+                path: "/data/count.txt".to_string(),
+                basename: "count.txt".to_string(),
+                nameroot: "count".to_string(),
+                nameext: ".txt".to_string(),
+                size: 3,
+                checksum: None,
+                secondary_files: Vec::new(),
+                contents: Some("42\n".to_string()),
+            }),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 42),
+            other => panic!("expected Int(42), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_ternary() {
+        // Test $({'output': inputs.i1 == 'the-default' ? 1 : 2})
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some(
+                "$({'output': inputs.i1 == 'the-default' ? 1 : 2})".to_string(),
+            ),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "i1".to_string(),
+            ResolvedValue::String("the-default".to_string()),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 1),
+            other => panic!("expected Int(1), got {:?}", other),
+        }
+
+        // And with a different value
+        inputs.insert(
+            "i1".to_string(),
+            ResolvedValue::String("other-value".to_string()),
+        );
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 2),
+            other => panic!("expected Int(2), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_ternary_in_js_return() {
+        // Test ${return {'output': (inputs.i1 == 'the-default' ? 1 : 2)};}
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: HashMap::new(),
+            outputs: HashMap::new(),
+            expression: Some(
+                "${return {'output': (inputs.i1 == 'the-default' ? 1 : 2)};}".to_string(),
+            ),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "i1".to_string(),
+            ResolvedValue::String("the-default".to_string()),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 1),
+            other => panic!("expected Int(1), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn execute_expression_tool_load_contents() {
+        use std::io::Write;
+
+        // Create a temp file with content
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("count.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        write!(f, "  16\n").unwrap();
+        drop(f);
+
+        let mut tool_inputs = HashMap::new();
+        tool_inputs.insert(
+            "file1".to_string(),
+            crate::model::ToolInput {
+                id: None,
+                cwl_type: crate::model::CwlType::Single("File".to_string()),
+                input_binding: None,
+                secondary_files: Vec::new(),
+                doc: None,
+                default: None,
+                load_contents: Some(true),
+            },
+        );
+
+        let expr_tool = ExpressionTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: tool_inputs,
+            outputs: HashMap::new(),
+            expression: Some(
+                "${return {\"output\": parseInt(inputs.file1.contents)};}".to_string(),
+            ),
+        };
+
+        // Input file WITHOUT contents pre-loaded (loadContents should load them)
+        let mut inputs = HashMap::new();
+        inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::File(FileValue {
+                path: file_path.to_string_lossy().to_string(),
+                basename: "count.txt".to_string(),
+                nameroot: "count".to_string(),
+                nameext: ".txt".to_string(),
+                size: 5,
+                checksum: None,
+                secondary_files: Vec::new(),
+                contents: None, // NOT pre-loaded
+            }),
+        );
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(n)) => assert_eq!(*n, 16),
+            other => panic!("expected Int(16), got {:?}", other),
+        }
+    }
+
+    // -- Test: resolve_step_inputs with multiple sources (array) ----------------
+
+    #[test]
+    fn resolve_step_inputs_multiple_sources() {
+        let mut wf_inputs = HashMap::new();
+        wf_inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::String("alpha".to_string()),
+        );
+
+        let mut step_out = HashMap::new();
+        let mut s1_out = HashMap::new();
+        s1_out.insert(
+            "output".to_string(),
+            ResolvedValue::String("beta".to_string()),
+        );
+        step_out.insert("step1".to_string(), s1_out);
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let mut step_in = HashMap::new();
+        step_in.insert(
+            "merged".to_string(),
+            StepInput::Structured(StepInputEntry {
+                id: None,
+                source: Some(SourceField::Multiple(vec![
+                    "file1".to_string(),
+                    "step1/output".to_string(),
+                ])),
+                value_from: None,
+                default: None,
+                link_merge: None,
+            }),
+        );
+
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_out, &runtime, None).unwrap();
+        match resolved.get("merged") {
+            Some(ResolvedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 2);
+                assert!(matches!(&arr[0], ResolvedValue::String(s) if s == "alpha"));
+                assert!(matches!(&arr[1], ResolvedValue::String(s) if s == "beta"));
+            }
+            other => panic!("expected Array of 2, got {:?}", other),
+        }
+    }
+
+    // -- Test: ExpressionTool applies defaults when input is missing -----------
+
+    #[test]
+    fn execute_expression_tool_uses_defaults() {
+        use crate::model::{CwlType, ExpressionTool, ToolInput};
+
+        let mut inputs_def = HashMap::new();
+        inputs_def.insert(
+            "i1".to_string(),
+            ToolInput {
+                id: None,
+                cwl_type: CwlType::Single("Any".to_string()),
+                input_binding: None,
+                secondary_files: Vec::new(),
+                doc: None,
+                default: Some(serde_yaml::Value::String("the-default".to_string())),
+                load_contents: None,
+            },
+        );
+
+        let expr_tool = ExpressionTool {
+            cwl_version: Some("v1.2".to_string()),
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: inputs_def,
+            outputs: HashMap::new(),
+            expression: Some("$({'output': (inputs.i1 == 'the-default' ? 1 : 2)})".to_string()),
+        };
+
+        let empty_inputs = HashMap::new();
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".to_string(),
+            tmpdir: "/tmp/tmp".to_string(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &empty_inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(1)) => {} // correct: default matches
+            other => panic!("expected Int(1), got {:?}", other),
+        }
+    }
+
+    // -- Test: null input uses default for expression tool ---------------------
+
+    #[test]
+    fn execute_expression_tool_null_uses_default() {
+        use crate::model::{CwlType, ToolInput, ToolOutput};
+
+        let expr_tool = ExpressionTool {
+            cwl_version: Some("v1.2".into()),
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "i1".to_string(),
+                    ToolInput {
+                        id: None,
+                        cwl_type: CwlType::Single("Any".into()),
+                        input_binding: None,
+                        secondary_files: Vec::new(),
+                        doc: None,
+                        default: Some(serde_yaml::Value::String("the-default".into())),
+                        load_contents: None,
+                    },
+                );
+                m
+            },
+            outputs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "output".to_string(),
+                    ToolOutput {
+                        id: None,
+                        cwl_type: CwlType::Single("int".into()),
+                        output_binding: None,
+                        secondary_files: Vec::new(),
+                        doc: None,
+                    },
+                );
+                m
+            },
+            expression: Some("$({'output': (inputs.i1 == 'the-default' ? 1 : 2)})".into()),
+        };
+
+        // Pass explicit null: should use default
+        let mut inputs = HashMap::new();
+        inputs.insert("i1".to_string(), ResolvedValue::Null);
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".into(),
+            tmpdir: "/tmp/tmp".into(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime).unwrap();
+        match result.get("output") {
+            Some(ResolvedValue::Int(1)) => {} // correct: null -> default -> matches
+            other => panic!("expected Int(1), got {:?}", other),
+        }
+    }
+
+    // -- Test: null input without default fails for required type ---------------
+
+    #[test]
+    fn execute_expression_tool_null_no_default_fails() {
+        use crate::model::{CwlType, ToolInput, ToolOutput};
+
+        let expr_tool = ExpressionTool {
+            cwl_version: Some("v1.2".into()),
+            label: None,
+            doc: None,
+            requirements: Vec::new(),
+            inputs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "i1".to_string(),
+                    ToolInput {
+                        id: None,
+                        cwl_type: CwlType::Single("Any".into()),
+                        input_binding: None,
+                        secondary_files: Vec::new(),
+                        doc: None,
+                        default: None, // No default
+                        load_contents: None,
+                    },
+                );
+                m
+            },
+            outputs: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "output".to_string(),
+                    ToolOutput {
+                        id: None,
+                        cwl_type: CwlType::Single("int".into()),
+                        output_binding: None,
+                        secondary_files: Vec::new(),
+                        doc: None,
+                    },
+                );
+                m
+            },
+            expression: Some("$({'output': 42})".into()),
+        };
+
+        let mut inputs = HashMap::new();
+        inputs.insert("i1".to_string(), ResolvedValue::Null);
+
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".into(),
+            tmpdir: "/tmp/tmp".into(),
+        };
+
+        let result = execute_expression_tool(&expr_tool, &inputs, &runtime);
+        assert!(result.is_err(), "should fail when required input is null with no default");
+    }
+
+    // -- Test: resolve_step_inputs with multiple sources and linkMerge ---------
+
+    #[test]
+    fn resolve_step_inputs_link_merge_flattened() {
+        let mut wf_inputs = HashMap::new();
+        wf_inputs.insert(
+            "files1".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::String("a".into()),
+                ResolvedValue::String("b".into()),
+            ]),
+        );
+        wf_inputs.insert(
+            "files2".to_string(),
+            ResolvedValue::Array(vec![
+                ResolvedValue::String("c".into()),
+            ]),
+        );
+        let step_outputs = HashMap::new();
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".into(),
+            tmpdir: "/tmp/tmp".into(),
+        };
+
+        let mut step_in = HashMap::new();
+        step_in.insert(
+            "merged".to_string(),
+            StepInput::Structured(StepInputEntry {
+                id: None,
+                source: Some(SourceField::Multiple(vec![
+                    "files1".into(),
+                    "files2".into(),
+                ])),
+                value_from: None,
+                default: None,
+                link_merge: Some("merge_flattened".into()),
+            }),
+        );
+
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime, None).unwrap();
+        match resolved.get("merged") {
+            Some(ResolvedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 3, "merge_flattened should flatten arrays");
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    // -- Test: single-element source array unwraps without linkMerge ----------
+
+    #[test]
+    fn resolve_step_inputs_single_source_unwraps() {
+        let mut wf_inputs = HashMap::new();
+        wf_inputs.insert(
+            "file1".to_string(),
+            ResolvedValue::String("hello".into()),
+        );
+        let step_outputs = HashMap::new();
+        let runtime = RuntimeContext {
+            cores: 1,
+            ram: 1024,
+            outdir: "/tmp/out".into(),
+            tmpdir: "/tmp/tmp".into(),
+        };
+
+        let mut step_in = HashMap::new();
+        step_in.insert(
+            "input1".to_string(),
+            StepInput::Structured(StepInputEntry {
+                id: None,
+                source: Some(SourceField::Multiple(vec!["file1".into()])),
+                value_from: None,
+                default: None,
+                link_merge: None, // No linkMerge with single source -> unwrap
+            }),
+        );
+
+        let resolved = resolve_step_inputs(&step_in, &wf_inputs, &step_outputs, &runtime, None).unwrap();
+        match resolved.get("input1") {
+            Some(ResolvedValue::String(s)) => {
+                assert_eq!(s, "hello", "single-element source without linkMerge should unwrap");
+            }
+            other => panic!("expected String, got {:?}", other),
         }
     }
 }

@@ -134,11 +134,15 @@ pub fn collect_outputs(
                 // Try simple parameter reference resolution first
                 let eval_str = output_eval.trim();
 
-                // Pattern: $(self[0].contents) or similar simple param refs
+                // Pattern: $(self[0].contents) or $(parseInt(...)) etc
                 if eval_str.starts_with("$(") && eval_str.ends_with(')') {
                     let inner = &eval_str[2..eval_str.len() - 1];
                     if let Some(resolved) =
                         eval_output_eval_param(inner, &self_val, inputs, runtime)
+                    {
+                        value = resolved;
+                    } else if let Some(resolved) =
+                        eval_output_eval_dollar_paren(inner, &self_val, inputs, runtime)
                     {
                         value = resolved;
                     }
@@ -412,6 +416,60 @@ fn eval_output_eval_js(
 
     // Simple expression
     eval_output_eval_sub_expr(body, self_val, inputs, runtime)
+}
+
+/// Evaluate an expression inside `$(...)` in outputEval context.
+/// Handles `parseInt(self[0].contents)`, `parseFloat(...)`, and other
+/// function-call patterns that `eval_output_eval_param` does not cover.
+fn eval_output_eval_dollar_paren(
+    expr: &str,
+    self_val: &ResolvedValue,
+    inputs: &HashMap<String, ResolvedValue>,
+    runtime: &RuntimeContext,
+) -> Option<ResolvedValue> {
+    let expr = expr.trim();
+
+    // parseInt(...)
+    if let Some(parse_inner) = expr
+        .strip_prefix("parseInt(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_output_eval_sub_expr(parse_inner.trim(), self_val, inputs, runtime)?;
+        let s = match &inner_val {
+            ResolvedValue::String(s) => s.clone(),
+            ResolvedValue::Int(n) => return Some(ResolvedValue::Int(*n)),
+            ResolvedValue::Float(f) => return Some(ResolvedValue::Int(*f as i64)),
+            _ => return None,
+        };
+        let s = s.trim();
+        let numeric: String = if s.starts_with('-') {
+            std::iter::once('-')
+                .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                .collect()
+        } else {
+            s.chars().take_while(|c| c.is_ascii_digit()).collect()
+        };
+        let n = numeric.parse::<i64>().ok()?;
+        return Some(ResolvedValue::Int(n));
+    }
+
+    // parseFloat(...)
+    if let Some(parse_inner) = expr
+        .strip_prefix("parseFloat(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let inner_val = eval_output_eval_sub_expr(parse_inner.trim(), self_val, inputs, runtime)?;
+        let f = match &inner_val {
+            ResolvedValue::String(s) => s.trim().parse::<f64>().ok()?,
+            ResolvedValue::Int(n) => *n as f64,
+            ResolvedValue::Float(f) => *f,
+            _ => return None,
+        };
+        return Some(ResolvedValue::Float(f));
+    }
+
+    // Fall through to sub-expr evaluator
+    eval_output_eval_sub_expr(expr, self_val, inputs, runtime)
 }
 
 /// Evaluate a sub-expression within outputEval JS context.
@@ -911,6 +969,59 @@ mod tests {
         match result.get("text").unwrap() {
             ResolvedValue::String(s) => assert_eq!(s, "hello world"),
             other => panic!("expected String(\"hello world\"), got {:?}", other),
+        }
+    }
+
+    // -- outputEval with $(parseInt(...)) pattern (dollar-paren) ---------------
+
+    #[test]
+    fn collect_outputs_output_eval_dollar_paren_parse_int() {
+        use crate::model::{CommandLineTool, CwlType, OutputBinding, ToolOutput};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+
+        fs::write(workdir.join("output.txt"), "  16  198 1111 /tmp/whale.txt\n").unwrap();
+
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "output".to_string(),
+            ToolOutput {
+                id: None,
+                cwl_type: CwlType::Single("int".to_string()),
+                output_binding: Some(OutputBinding {
+                    glob: GlobPattern::Single("output.txt".to_string()),
+                    load_contents: Some(true),
+                    output_eval: Some("$(parseInt(self[0].contents))".to_string()),
+                }),
+                secondary_files: Vec::new(),
+                doc: None,
+            },
+        );
+
+        let tool = CommandLineTool {
+            cwl_version: None,
+            label: None,
+            doc: None,
+            base_command: crate::model::BaseCommand::Single("wc".to_string()),
+            arguments: Vec::new(),
+            inputs: HashMap::new(),
+            outputs,
+            requirements: Vec::new(),
+            hints: Vec::new(),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+        };
+
+        let inputs = HashMap::new();
+        let runtime = test_runtime();
+        let result = collect_outputs(&tool, &inputs, &runtime, workdir).unwrap();
+
+        match result.get("output").unwrap() {
+            ResolvedValue::Int(n) => assert_eq!(*n, 16),
+            other => panic!("expected Int(16), got {:?}", other),
         }
     }
 }
