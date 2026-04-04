@@ -285,12 +285,10 @@ fn find_auto_generated_file(workdir: &Path, suffix: &str) -> Result<ResolvedValu
     let pattern = workdir.join(format!("*{}", suffix));
     let pattern_str = pattern.to_string_lossy().to_string();
     if let Ok(entries) = glob::glob(&pattern_str) {
-        for entry in entries {
-            if let Ok(path) = entry {
-                if path.is_file() {
-                    let fv = FileValue::from_path(path.to_string_lossy().as_ref());
-                    return Ok(ResolvedValue::File(fv));
-                }
+        for path in entries.flatten() {
+            if path.is_file() {
+                let fv = FileValue::from_path(path.to_string_lossy().as_ref());
+                return Ok(ResolvedValue::File(fv));
             }
         }
     }
@@ -346,7 +344,7 @@ fn eval_output_eval_param(
         } else {
             None
         }
-    } else if inner == "self.length" || inner == "self.length" {
+    } else if inner == "self.length" {
         if let ResolvedValue::Array(arr) = self_val {
             Some(ResolvedValue::Int(arr.len() as i64))
         } else {
@@ -407,9 +405,9 @@ fn eval_output_eval_js(
         };
         // parseInt in JS stops at first non-digit
         let s = s.trim();
-        let numeric: String = if s.starts_with('-') {
+        let numeric: String = if let Some(rest) = s.strip_prefix('-') {
             std::iter::once('-')
-                .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                .chain(rest.chars().take_while(|c| c.is_ascii_digit()))
                 .collect()
         } else {
             s.chars().take_while(|c| c.is_ascii_digit()).collect()
@@ -461,9 +459,9 @@ fn eval_output_eval_dollar_paren(
             _ => return None,
         };
         let s = s.trim();
-        let numeric: String = if s.starts_with('-') {
+        let numeric: String = if let Some(rest) = s.strip_prefix('-') {
             std::iter::once('-')
-                .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                .chain(rest.chars().take_while(|c| c.is_ascii_digit()))
                 .collect()
         } else {
             s.chars().take_while(|c| c.is_ascii_digit()).collect()
@@ -501,9 +499,7 @@ fn eval_output_eval_sub_expr(
     let expr = expr.trim();
 
     // self[N].property
-    if expr.starts_with("self[") || expr == "self" || expr.starts_with("self.") {
-        eval_output_eval_param(expr, self_val, inputs, runtime)
-    } else if expr.starts_with("inputs.") {
+    if expr.starts_with("self[") || expr == "self" || expr.starts_with("self.") || expr.starts_with("inputs.") {
         eval_output_eval_param(expr, self_val, inputs, runtime)
     } else if let Ok(n) = expr.parse::<i64>() {
         Some(ResolvedValue::Int(n))

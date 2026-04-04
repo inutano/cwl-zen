@@ -89,11 +89,7 @@ pub fn execute_tool(
     // parameter, the default value for that parameter is used."
     let mut inputs = inputs.clone();
     for (name, input_def) in &tool.inputs {
-        let needs_default = match inputs.get(name) {
-            None => true,
-            Some(ResolvedValue::Null) => true,
-            _ => false,
-        };
+        let needs_default = matches!(inputs.get(name), None | Some(ResolvedValue::Null));
         if needs_default {
             if let Some(default) = &input_def.default {
                 let mut resolved = yaml_to_resolved(default);
@@ -189,7 +185,7 @@ pub fn execute_tool(
         // Direct execution (no container)
         let mut cmd = if resolved_cmd.use_shell {
             let mut c = Command::new("sh");
-            c.arg("-c").arg(&resolved_cmd.command_line());
+            c.arg("-c").arg(resolved_cmd.command_line());
             c
         } else {
             if resolved_cmd.args.is_empty() {
@@ -369,11 +365,7 @@ pub fn execute_workflow(
     // workflow input's default value (if declared).
     let mut inputs = inputs.clone();
     for (name, wf_input) in &workflow.inputs {
-        let needs_default = match inputs.get(name) {
-            None => true,
-            Some(ResolvedValue::Null) => true,
-            _ => false,
-        };
+        let needs_default = matches!(inputs.get(name), None | Some(ResolvedValue::Null));
         if needs_default {
             if let Some(default) = &wf_input.default {
                 inputs.insert(name.clone(), yaml_to_resolved(default));
@@ -699,11 +691,7 @@ pub fn execute_expression_tool(
     // parameter, the default value for that parameter is used."
     let mut inputs = inputs.clone();
     for (name, input_def) in &expr_tool.inputs {
-        let needs_default = match inputs.get(name) {
-            None => true,
-            Some(ResolvedValue::Null) => true,
-            _ => false,
-        };
+        let needs_default = matches!(inputs.get(name), None | Some(ResolvedValue::Null));
         if needs_default {
             if let Some(default) = &input_def.default {
                 inputs.insert(name.clone(), yaml_to_resolved(default));
@@ -1086,9 +1074,9 @@ fn parse_int_from_value(val: &ResolvedValue) -> Option<i64> {
         ResolvedValue::String(s) => {
             // parseInt in JS stops at the first non-numeric char
             let s = s.trim();
-            let numeric: String = if s.starts_with('-') {
+            let numeric: String = if let Some(rest) = s.strip_prefix('-') {
                 std::iter::once('-')
-                    .chain(s[1..].chars().take_while(|c| c.is_ascii_digit()))
+                    .chain(rest.chars().take_while(|c| c.is_ascii_digit()))
                     .collect()
             } else {
                 s.chars().take_while(|c| c.is_ascii_digit()).collect()

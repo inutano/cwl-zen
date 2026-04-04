@@ -142,7 +142,7 @@ pub fn build_command(
                     // Join array elements with separator into single value
                     let value_str = arr
                         .iter()
-                        .map(|v| param::value_to_string(v))
+                        .map(param::value_to_string)
                         .collect::<Vec<_>>()
                         .join(sep);
 

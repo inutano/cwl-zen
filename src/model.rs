@@ -798,7 +798,7 @@ impl<'de> Deserialize<'de> for StepOutputList {
                         serde_yaml::Value::String(s) => result.push(s),
                         serde_yaml::Value::Mapping(m) => {
                             if let Some(serde_yaml::Value::String(id)) =
-                                m.get(&serde_yaml::Value::String("id".to_string()))
+                                m.get(serde_yaml::Value::String("id".to_string()))
                             {
                                 result.push(id.clone());
                             }
@@ -956,6 +956,7 @@ pub enum ResolvedValue {
 
 /// Represents a CWL File or Directory value with computed fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct FileValue {
     pub path: String,
     pub basename: String,
@@ -973,21 +974,6 @@ pub struct FileValue {
 }
 
 // Allow constructing FileValue in tests without specifying format
-impl Default for FileValue {
-    fn default() -> Self {
-        FileValue {
-            path: String::new(),
-            basename: String::new(),
-            nameroot: String::new(),
-            nameext: String::new(),
-            size: 0,
-            checksum: None,
-            secondary_files: Vec::new(),
-            contents: None,
-            format: None,
-        }
-    }
-}
 
 impl FileValue {
     /// Build a `FileValue` from a filesystem path. The file does not need to

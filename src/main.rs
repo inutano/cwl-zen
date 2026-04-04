@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
-use serde_json;
 
 use cwl_zen::container;
 use cwl_zen::dag;
