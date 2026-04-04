@@ -85,6 +85,9 @@ pub fn value_to_json(val: &ResolvedValue) -> serde_json::Value {
             if let Some(ref contents) = fv.contents {
                 obj["contents"] = serde_json::json!(contents);
             }
+            if let Some(ref fmt) = fv.format {
+                obj["format"] = serde_json::json!(fmt);
+            }
             if !fv.secondary_files.is_empty() {
                 obj["secondaryFiles"] = serde_json::Value::Array(
                     fv.secondary_files.iter().map(|sf| value_to_json(&ResolvedValue::File(sf.clone()))).collect()
@@ -93,11 +96,13 @@ pub fn value_to_json(val: &ResolvedValue) -> serde_json::Value {
             obj
         }
         ResolvedValue::Directory(fv) => {
+            let listing = build_directory_listing(&fv.path);
             serde_json::json!({
                 "class": "Directory",
                 "location": format!("file://{}", fv.path),
                 "path": &fv.path,
                 "basename": &fv.basename,
+                "listing": listing,
             })
         }
         ResolvedValue::Array(arr) => {
@@ -114,6 +119,53 @@ pub fn outputs_to_json(outputs: &std::collections::HashMap<String, ResolvedValue
         map.insert(name.clone(), value_to_json(val));
     }
     serde_json::Value::Object(map)
+}
+
+/// Build a directory listing (array of File/Directory entries) for a directory path.
+fn build_directory_listing(dir_path: &str) -> serde_json::Value {
+    let path = std::path::Path::new(dir_path);
+    if !path.is_dir() {
+        return serde_json::Value::Array(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    if let Ok(read_dir) = std::fs::read_dir(path) {
+        let mut items: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+        items.sort_by_key(|e| e.file_name());
+        for entry in items {
+            let entry_path = entry.path();
+            let entry_path_str = entry_path.to_string_lossy().to_string();
+            if entry_path.is_dir() {
+                let basename = entry_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let inner_listing = build_directory_listing(&entry_path_str);
+                entries.push(serde_json::json!({
+                    "class": "Directory",
+                    "location": format!("file://{}", entry_path_str),
+                    "path": &entry_path_str,
+                    "basename": basename,
+                    "listing": inner_listing,
+                }));
+            } else {
+                let fv = crate::model::FileValue::from_path(&entry_path_str);
+                let mut obj = serde_json::json!({
+                    "class": "File",
+                    "location": format!("file://{}", fv.path),
+                    "path": &fv.path,
+                    "basename": &fv.basename,
+                    "nameroot": &fv.nameroot,
+                    "nameext": &fv.nameext,
+                    "size": fv.size,
+                });
+                if let Some(ref cs) = fv.checksum {
+                    obj["checksum"] = serde_json::json!(cs);
+                }
+                entries.push(obj);
+            }
+        }
+    }
+    serde_json::Value::Array(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +212,22 @@ fn resolve_expression(
         }
     } else if let Some(rest) = expr.strip_prefix("self.") {
         resolve_self_property(rest, self_val)
+    } else if (expr.starts_with('"') && expr.ends_with('"'))
+        || (expr.starts_with('\'') && expr.ends_with('\''))
+    {
+        // JS string literal: $("a string") or $('a string')
+        expr[1..expr.len() - 1].to_string()
+    } else if let Ok(n) = expr.parse::<i64>() {
+        // JS numeric literal
+        n.to_string()
+    } else if let Ok(f) = expr.parse::<f64>() {
+        f.to_string()
+    } else if expr == "null" {
+        "null".to_string()
+    } else if expr == "true" {
+        "true".to_string()
+    } else if expr == "false" {
+        "false".to_string()
     } else {
         // Unknown expression — return "null"
         "null".to_string()
@@ -255,6 +323,7 @@ mod tests {
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
         inputs
@@ -358,6 +427,7 @@ mod tests {
             checksum: None,
             secondary_files: Vec::new(),
             contents: None,
+                format: None,
         });
         let result = resolve_param_refs("$(self.path)", &inputs, &runtime, Some(&self_val));
         assert_eq!(result, "/data/input.bam");
@@ -431,6 +501,7 @@ mod tests {
             checksum: None,
             secondary_files: Vec::new(),
             contents: None,
+                format: None,
         };
         assert_eq!(
             value_to_string(&ResolvedValue::File(fv.clone())),

@@ -158,6 +158,25 @@ pub fn collect_outputs(
             }
         }
 
+        // Set format field on File outputs if the output definition has a format
+        if let Some(ref fmt) = output.format {
+            // Resolve parameter references in the format string
+            let resolved_fmt = param::resolve_param_refs(fmt, inputs, runtime, None);
+            match &mut value {
+                ResolvedValue::File(ref mut fv) => {
+                    fv.format = Some(resolved_fmt);
+                }
+                ResolvedValue::Array(ref mut arr) => {
+                    for item in arr.iter_mut() {
+                        if let ResolvedValue::File(ref mut fv) = item {
+                            fv.format = Some(resolved_fmt.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         result.insert(name.clone(), value);
     }
 
@@ -537,6 +556,7 @@ mod tests {
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
         inputs
@@ -623,6 +643,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -674,6 +695,7 @@ mod tests {
                 output_binding: None,
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -726,6 +748,7 @@ mod tests {
                 output_binding: None,
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -782,6 +805,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -837,6 +861,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -891,6 +916,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -944,6 +970,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 
@@ -997,6 +1024,7 @@ mod tests {
                 }),
                 secondary_files: Vec::new(),
                 doc: None,
+                format: None,
             },
         );
 

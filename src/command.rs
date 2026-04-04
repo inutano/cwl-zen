@@ -133,6 +133,10 @@ pub fn build_command(
         // a single string. Without itemSeparator, each array element becomes a
         // separate arg (possibly each prefixed).
         if let ResolvedValue::Array(arr) = val {
+            // Empty arrays produce no command line arguments
+            if arr.is_empty() {
+                continue;
+            }
             if binding.value_from.is_none() {
                 if let Some(ref sep) = binding.item_separator {
                     // Join array elements with separator into single value
@@ -208,6 +212,19 @@ pub fn build_command(
                     continue;
                 }
             }
+        }
+
+        // Handle boolean values: true with prefix emits flag, false emits nothing,
+        // true without prefix emits nothing (CWL spec).
+        if let ResolvedValue::Bool(b) = val {
+            if !b {
+                continue; // false booleans never emit anything
+            }
+            if let Some(ref prefix) = binding.prefix {
+                parts.push((position, vec![prefix.clone()]));
+            }
+            // true without prefix: emit nothing
+            continue;
         }
 
         let value_str = if let Some(ref vf) = binding.value_from {
@@ -346,6 +363,7 @@ mod tests {
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
 
@@ -377,6 +395,7 @@ mod tests {
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
 
@@ -433,6 +452,7 @@ outputs: {}
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
 
@@ -563,6 +583,7 @@ outputs: {}
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
 
@@ -712,6 +733,7 @@ stdin: $(inputs.file1.path)
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
         let cmd = build_command(&tool, &inputs, &basic_runtime());
@@ -782,6 +804,7 @@ outputs: {}
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
         inputs.insert(
@@ -796,6 +819,7 @@ outputs: {}
                     checksum: None,
                     secondary_files: Vec::new(),
                     contents: None,
+                    format: None,
                 }),
                 ResolvedValue::File(FileValue {
                     path: "file2.fastq".to_string(),
@@ -806,6 +830,7 @@ outputs: {}
                     checksum: None,
                     secondary_files: Vec::new(),
                     contents: None,
+                    format: None,
                 }),
             ]),
         );
@@ -859,6 +884,7 @@ outputs: {}
                     checksum: None,
                     secondary_files: Vec::new(),
                     contents: None,
+                    format: None,
                 }),
                 ResolvedValue::File(FileValue {
                     path: "b.txt".to_string(),
@@ -869,6 +895,7 @@ outputs: {}
                     checksum: None,
                     secondary_files: Vec::new(),
                     contents: None,
+                    format: None,
                 }),
             ]),
         );

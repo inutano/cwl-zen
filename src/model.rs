@@ -380,6 +380,9 @@ pub struct ToolOutput {
 
     #[serde(default)]
     pub doc: Option<String>,
+
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 impl HasId for ToolOutput {
@@ -394,6 +397,7 @@ impl HasId for ToolOutput {
             output_binding: None,
             secondary_files: Vec::new(),
             doc: None,
+            format: None,
         })
     }
 }
@@ -963,6 +967,26 @@ pub struct FileValue {
     /// File contents loaded when `loadContents: true` (limited to 64 KiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
+    /// Format URI (from output format field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+// Allow constructing FileValue in tests without specifying format
+impl Default for FileValue {
+    fn default() -> Self {
+        FileValue {
+            path: String::new(),
+            basename: String::new(),
+            nameroot: String::new(),
+            nameext: String::new(),
+            size: 0,
+            checksum: None,
+            secondary_files: Vec::new(),
+            contents: None,
+            format: None,
+        }
+    }
 }
 
 impl FileValue {
@@ -1014,6 +1038,7 @@ impl FileValue {
             checksum,
             secondary_files: Vec::new(),
             contents: None,
+            format: None,
         }
     }
 }

@@ -10,8 +10,8 @@ use crate::command;
 use crate::container::{self, ContainerEngine, ContainerExecRequest};
 use crate::dag::DagStep;
 use crate::model::{
-    CwlDocument, ExpressionTool, FileValue, ResolvedValue, RuntimeContext, SourceField, StepInput,
-    StepRun, Workflow,
+    CwlDocument, ExpressionTool, FileValue, ResolvedValue, RuntimeContext, ScatterField,
+    SourceField, StepInput, StepRun, Workflow,
 };
 use crate::param;
 use crate::parse;
@@ -140,6 +140,15 @@ pub fn execute_tool(
         })?;
     }
 
+    // 2c. Resolve EnvVarRequirement
+    let env_vars: Vec<(String, String)> = parse::env_var_requirement(tool)
+        .iter()
+        .map(|(name, template)| {
+            let resolved = param::resolve_param_refs(template, &staged_inputs, runtime, None);
+            (name.clone(), resolved)
+        })
+        .collect();
+
     // 3. Build command using staged inputs
     let resolved_cmd = command::build_command(tool, &staged_inputs, runtime);
 
@@ -200,6 +209,11 @@ pub fn execute_tool(
 
         cmd.stdout(stdout_file).stderr(stderr_file);
         cmd.current_dir(workdir);
+
+        // Set environment variables from EnvVarRequirement
+        for (env_name, env_value) in &env_vars {
+            cmd.env(env_name, env_value);
+        }
 
         // Redirect stdin from file if specified (skip if resolved to "null" or empty)
         if let Some(ref stdin_path) = resolved_cmd.stdin_file {
@@ -448,57 +462,176 @@ pub fn execute_workflow(
             _ => bail!("step '{}' must reference a CommandLineTool, not a Workflow", step_name),
         };
 
-        // c. Create per-step workdir
-        let step_workdir = outdir.join(".steps").join(step_name);
-        let runtime = RuntimeContext {
-            cores: 1,
-            ram: 1024,
-            outdir: step_workdir.to_string_lossy().to_string(),
-            tmpdir: step_workdir.join("tmp").to_string_lossy().to_string(),
-        };
-
-        // d. Execute the tool
-        let (exit_code, outputs) = execute_tool(
-            &tool,
-            &step_inputs,
-            &step_workdir,
-            &runtime,
-            &log_dir,
-            step_name,
-            engine,
-            staging_mode,
-            no_retry_copy,
-            tool_path.canonicalize().ok().as_deref()
-                .and_then(|p| p.parent())
-                .or_else(|| tool_path.parent())
-                .or(Some(Path::new("."))),
-        )?;
-
-        let step_end = Utc::now();
+        // Resolve resource requirements for runtime context
+        let (res_cores, res_ram) = parse::resource_requirement(&tool);
         let container_image = parse::docker_image(&tool);
 
-        // e. Record StepResult
-        step_results.push(StepResult {
-            step_name: step_name.clone(),
-            tool_path: tool_path.clone(),
-            container_image,
-            start_time: step_start,
-            end_time: step_end,
-            exit_code,
-            inputs: step_inputs,
-            outputs: outputs.clone(),
-            stdout_path: Some(log_dir.join(format!("{}.stdout.log", step_name))),
-            stderr_path: Some(log_dir.join(format!("{}.stderr.log", step_name))),
-        });
+        // Check if step has scatter
+        if let Some(ref scatter_field) = wf_step.scatter {
+            let scatter_inputs: Vec<String> = match scatter_field {
+                ScatterField::Single(s) => vec![s.clone()],
+                ScatterField::Multiple(v) => v.clone(),
+            };
+            let scatter_method = wf_step.scatter_method.as_deref().unwrap_or("dotproduct");
 
-        // f. If non-zero exit, mark as failed and break
-        if exit_code != 0 {
-            success = false;
-            break;
+            // Build input combinations based on scatter method
+            let input_combos = build_scatter_combinations(
+                &step_inputs,
+                &scatter_inputs,
+                scatter_method,
+            )?;
+
+            // Collect output names from the tool
+            let output_names: Vec<String> = tool.outputs.keys().cloned().collect();
+
+            // Initialize per-output result arrays
+            let mut scatter_results: HashMap<String, Vec<ResolvedValue>> = HashMap::new();
+            for oname in &output_names {
+                scatter_results.insert(oname.clone(), Vec::new());
+            }
+
+            let mut any_failed = false;
+            for (i, combo) in input_combos.iter().enumerate() {
+                let iter_workdir = outdir.join(".steps").join(format!("{}_{}", step_name, i));
+                let runtime = RuntimeContext {
+                    cores: res_cores,
+                    ram: res_ram,
+                    outdir: iter_workdir.to_string_lossy().to_string(),
+                    tmpdir: iter_workdir.join("tmp").to_string_lossy().to_string(),
+                };
+
+                let (exit_code, iter_outputs) = execute_tool(
+                    &tool,
+                    combo,
+                    &iter_workdir,
+                    &runtime,
+                    &log_dir,
+                    &format!("{}_{}", step_name, i),
+                    engine,
+                    staging_mode,
+                    no_retry_copy,
+                    tool_path.canonicalize().ok().as_deref()
+                        .and_then(|p| p.parent())
+                        .or_else(|| tool_path.parent())
+                        .or(Some(Path::new("."))),
+                )?;
+
+                if exit_code != 0 {
+                    any_failed = true;
+                    break;
+                }
+
+                for oname in &output_names {
+                    let val = iter_outputs.get(oname).cloned().unwrap_or(ResolvedValue::Null);
+                    scatter_results.get_mut(oname).unwrap().push(val);
+                }
+            }
+
+            if any_failed {
+                success = false;
+                let step_end = Utc::now();
+                step_results.push(StepResult {
+                    step_name: step_name.clone(),
+                    tool_path: tool_path.clone(),
+                    container_image,
+                    start_time: step_start,
+                    end_time: step_end,
+                    exit_code: 1,
+                    inputs: step_inputs,
+                    outputs: HashMap::new(),
+                    stdout_path: None,
+                    stderr_path: None,
+                });
+                break;
+            }
+
+            // For nested_crossproduct with multiple scatter inputs, reshape into nested arrays
+            let mut outputs = HashMap::new();
+            if scatter_method == "nested_crossproduct" && scatter_inputs.len() >= 2 {
+                // Get lengths of each scatter dimension
+                let mut dim_sizes: Vec<usize> = Vec::new();
+                for sname in &scatter_inputs {
+                    let len = match step_inputs.get(sname) {
+                        Some(ResolvedValue::Array(arr)) => arr.len(),
+                        _ => 0,
+                    };
+                    dim_sizes.push(len);
+                }
+
+                for oname in &output_names {
+                    let flat = scatter_results.remove(oname).unwrap_or_default();
+                    let nested = reshape_nested(&flat, &dim_sizes, 0);
+                    outputs.insert(oname.clone(), nested);
+                }
+            } else {
+                for oname in &output_names {
+                    let arr = scatter_results.remove(oname).unwrap_or_default();
+                    outputs.insert(oname.clone(), ResolvedValue::Array(arr));
+                }
+            }
+
+            let step_end = Utc::now();
+            step_results.push(StepResult {
+                step_name: step_name.clone(),
+                tool_path: tool_path.clone(),
+                container_image,
+                start_time: step_start,
+                end_time: step_end,
+                exit_code: 0,
+                inputs: step_inputs,
+                outputs: outputs.clone(),
+                stdout_path: None,
+                stderr_path: None,
+            });
+            step_outputs.insert(step_name.clone(), outputs);
+        } else {
+            // Non-scatter execution (original path)
+            let step_workdir = outdir.join(".steps").join(step_name);
+            let runtime = RuntimeContext {
+                cores: res_cores,
+                ram: res_ram,
+                outdir: step_workdir.to_string_lossy().to_string(),
+                tmpdir: step_workdir.join("tmp").to_string_lossy().to_string(),
+            };
+
+            let (exit_code, outputs) = execute_tool(
+                &tool,
+                &step_inputs,
+                &step_workdir,
+                &runtime,
+                &log_dir,
+                step_name,
+                engine,
+                staging_mode,
+                no_retry_copy,
+                tool_path.canonicalize().ok().as_deref()
+                    .and_then(|p| p.parent())
+                    .or_else(|| tool_path.parent())
+                    .or(Some(Path::new("."))),
+            )?;
+
+            let step_end = Utc::now();
+
+            step_results.push(StepResult {
+                step_name: step_name.clone(),
+                tool_path: tool_path.clone(),
+                container_image,
+                start_time: step_start,
+                end_time: step_end,
+                exit_code,
+                inputs: step_inputs,
+                outputs: outputs.clone(),
+                stdout_path: Some(log_dir.join(format!("{}.stdout.log", step_name))),
+                stderr_path: Some(log_dir.join(format!("{}.stderr.log", step_name))),
+            });
+
+            if exit_code != 0 {
+                success = false;
+                break;
+            }
+
+            step_outputs.insert(step_name.clone(), outputs);
         }
-
-        // g. Store step outputs for downstream steps
-        step_outputs.insert(step_name.clone(), outputs);
     }
 
     // 4. Resolve workflow-level outputs from step outputs
@@ -1062,6 +1195,112 @@ fn resolve_source(
     }
 }
 
+/// Build input combinations for scatter execution.
+///
+/// For `dotproduct`: zip elements from each scattered input array.
+/// For `flat_crossproduct` / `nested_crossproduct`: create cross product.
+fn build_scatter_combinations(
+    base_inputs: &HashMap<String, ResolvedValue>,
+    scatter_inputs: &[String],
+    scatter_method: &str,
+) -> Result<Vec<HashMap<String, ResolvedValue>>> {
+    if scatter_inputs.is_empty() {
+        return Ok(vec![base_inputs.clone()]);
+    }
+
+    // Extract arrays for each scattered input
+    let mut arrays: Vec<(&str, Vec<ResolvedValue>)> = Vec::new();
+    for sname in scatter_inputs {
+        let arr = match base_inputs.get(sname) {
+            Some(ResolvedValue::Array(a)) => a.clone(),
+            Some(other) => vec![other.clone()], // treat scalar as single-element array
+            None => Vec::new(),
+        };
+        arrays.push((sname, arr));
+    }
+
+    if scatter_inputs.len() == 1 {
+        // Single scatter: iterate over the array
+        let (sname, arr) = &arrays[0];
+        let mut combos = Vec::new();
+        for item in arr {
+            let mut combo = base_inputs.clone();
+            combo.insert(sname.to_string(), item.clone());
+            combos.push(combo);
+        }
+        return Ok(combos);
+    }
+
+    match scatter_method {
+        "dotproduct" => {
+            // Zip: arrays must be same length
+            let len = arrays[0].1.len();
+            let mut combos = Vec::new();
+            for i in 0..len {
+                let mut combo = base_inputs.clone();
+                for (sname, arr) in &arrays {
+                    if let Some(item) = arr.get(i) {
+                        combo.insert(sname.to_string(), item.clone());
+                    }
+                }
+                combos.push(combo);
+            }
+            Ok(combos)
+        }
+        "flat_crossproduct" | "nested_crossproduct" => {
+            // Cross product: iterate over all combinations
+            let mut combos = vec![base_inputs.clone()];
+            for (sname, arr) in &arrays {
+                let mut new_combos = Vec::new();
+                for combo in &combos {
+                    for item in arr {
+                        let mut new_combo = combo.clone();
+                        new_combo.insert(sname.to_string(), item.clone());
+                        new_combos.push(new_combo);
+                    }
+                }
+                combos = new_combos;
+            }
+            Ok(combos)
+        }
+        _ => {
+            bail!("unsupported scatter method: {}", scatter_method);
+        }
+    }
+}
+
+/// Reshape a flat array of scatter results into nested arrays for nested_crossproduct.
+fn reshape_nested(flat: &[ResolvedValue], dim_sizes: &[usize], depth: usize) -> ResolvedValue {
+    if depth >= dim_sizes.len() - 1 || dim_sizes.len() <= 1 {
+        // Last dimension: return as flat array
+        return ResolvedValue::Array(flat.to_vec());
+    }
+
+    let outer_size = dim_sizes[depth];
+    if outer_size == 0 {
+        return ResolvedValue::Array(Vec::new());
+    }
+    let inner_size: usize = dim_sizes[depth + 1..].iter().product();
+    if inner_size == 0 {
+        // Inner dimension is empty: each outer element is an empty array
+        let mut result = Vec::new();
+        for _ in 0..outer_size {
+            result.push(ResolvedValue::Array(Vec::new()));
+        }
+        return ResolvedValue::Array(result);
+    }
+
+    let mut result = Vec::new();
+    for i in 0..outer_size {
+        let start = i * inner_size;
+        let end = start + inner_size;
+        let slice = if end <= flat.len() { &flat[start..end] } else { &[] };
+        let inner = reshape_nested(slice, dim_sizes, depth + 1);
+        result.push(inner);
+    }
+    ResolvedValue::Array(result)
+}
+
 /// Resolve step inputs from workflow inputs and upstream step outputs.
 fn resolve_step_inputs(
     step_in: &HashMap<String, StepInput>,
@@ -1250,6 +1489,7 @@ mod tests {
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None,
+                format: None,
             }),
         );
         step_outputs.insert("align".to_string(), align_outputs);
@@ -1736,6 +1976,7 @@ path: /data/outdir
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: Some("  16\n".to_string()),
+                format: None,
             }),
         );
 
@@ -1841,6 +2082,7 @@ path: /data/outdir
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: Some("42\n".to_string()),
+                format: None,
             }),
         );
 
@@ -1989,6 +2231,7 @@ path: /data/outdir
                 checksum: None,
                 secondary_files: Vec::new(),
                 contents: None, // NOT pre-loaded
+                format: None,
             }),
         );
 
@@ -2139,6 +2382,7 @@ path: /data/outdir
                         output_binding: None,
                         secondary_files: Vec::new(),
                         doc: None,
+                format: None,
                     },
                 );
                 m
@@ -2201,6 +2445,7 @@ path: /data/outdir
                         output_binding: None,
                         secondary_files: Vec::new(),
                         doc: None,
+                format: None,
                     },
                 );
                 m

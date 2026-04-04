@@ -232,9 +232,10 @@ fn cmd_run(
 
         CwlDocument::CommandLineTool(tool) => {
             let log_dir = outdir.join("logs");
+            let (res_cores, res_ram) = cwl_zen::parse::resource_requirement(&tool);
             let runtime = RuntimeContext {
-                cores: 1,
-                ram: 1024,
+                cores: res_cores,
+                ram: res_ram,
                 outdir: outdir.to_string_lossy().to_string(),
                 tmpdir: outdir.join("tmp").to_string_lossy().to_string(),
             };
